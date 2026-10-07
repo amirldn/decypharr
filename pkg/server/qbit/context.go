@@ -163,6 +163,10 @@ func (q *QBit) authenticate(ctx context.Context, category, username, password st
 			subtle.ConstantTimeCompare([]byte(password), []byte(instance.Token)) == 1 {
 			return instance, nil
 		}
+		// Arr login requests omit category; match their configured credentials.
+		if matchesConfiguredArr(cfg, username, password) {
+			return instance, nil
+		}
 		return arr.Arr{}, fmt.Errorf("unauthorized: invalid credentials")
 	}
 
@@ -187,6 +191,27 @@ func (q *QBit) authenticate(ctx context.Context, category, username, password st
 		q.manager.Arr().AddOrUpdate(instance)
 	}
 	return instance, nil
+}
+
+// matchesConfiguredArr reports whether username/password match the host and
+// token of an arr in the config. Compared in constant time, like VerifyToken.
+func matchesConfiguredArr(cfg *config.Config, username, password string) bool {
+	if username == "" || password == "" {
+		return false
+	}
+	host := strings.TrimRight(strings.TrimSpace(username), "/")
+	for _, configured := range cfg.Arrs {
+		if configured.Token == "" {
+			continue
+		}
+		if strings.TrimRight(strings.TrimSpace(configured.Host), "/") != host {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(password), []byte(configured.Token)) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func createSID(username, password string) string {

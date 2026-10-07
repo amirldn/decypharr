@@ -237,6 +237,9 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 	deadline := time.Now().Add(symlinkMountWaitTimeout)
 	delay := symlinkScanInitialInterval
 	attempt := 0
+	// Latched off the first time mount cache invalidation fails, so a torn-down
+	// mount costs one failed call rather than one per retry. See its use below.
+	refreshEnabled := true
 	var lastScanErr error
 	var scanErr error
 
@@ -304,6 +307,40 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 				Msg("Waiting for mount files before creating symlinks")
 		}
 
+		// Invalidate the mount's cached directory listing before the next scan.
+		//
+		// os.ReadDir here goes through the rclone VFS, which caches listings for
+		// dir_cache_time (default 5m). A torrent added seconds ago sits behind
+		// that cache, so rescanning the same path cannot observe it however long
+		// we wait — the loop just burns its budget against a stale listing and
+		// then either times out or, worse, links a path whose file never
+		// materialises, leaving 0-byte reads that the *arrs report as
+		// "Unable to determine if file is a sample".
+		//
+		// RefreshEntries(true) does fire when the download completes, but it runs
+		// in its own goroutine and races this loop: if it lands before the file
+		// is visible upstream, nothing invalidates the cache again. Re-forgetting
+		// on each retry is what actually closes that window.
+		//
+		// Best-effort, and deliberately latched off after the first failure.
+		//
+		// When the mount is torn down mid-wait — decypharr restarts itself on a
+		// config change, which hard-terminates the rclone RC server — every
+		// refresh call has to exhaust its own retry budget (4 attempts with
+		// backoff, ~9s) before returning. Repeating that on each iteration
+		// stalls this loop and delays the mount health check that would
+		// actually recover things. One failed attempt is enough to conclude the
+		// RC is unavailable; fall back to plain rescans, which still succeed
+		// once the mount returns or the dir cache TTL lapses.
+		if refreshEnabled {
+			if err := d.refreshMountForRetry(); err != nil {
+				refreshEnabled = false
+				d.logger.Debug().Err(err).
+					Str("entry", entry.Name).
+					Msg("Mount cache invalidation unavailable; falling back to plain rescans")
+			}
+		}
+
 		if err := d.sleepUntilNextSymlinkAttempt(delay, deadline); err != nil {
 			return nil, err
 		}
@@ -311,6 +348,25 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 	}
 
 	return filePaths, nil
+}
+
+// refreshMountForRetry drops the mount's cached directory listing so the next
+// scan sees files added since the cache was populated.
+//
+// This delegates to RefreshMount (vfs/forget + vfs/refresh over the RC API for
+// rclone mounts) rather than reimplementing invalidation, so it stays correct
+// for every mount type — DFS and "none" simply have nothing to forget.
+func (d *Downloader) refreshMountForRetry() error {
+	if d.manager == nil || d.manager.mountManager == nil {
+		return nil
+	}
+	if !d.manager.mountManager.IsReady() {
+		// Nothing to invalidate yet, and calling through would only surface a
+		// confusing "mount is not mounted" error while we are legitimately
+		// waiting for it to come up.
+		return nil
+	}
+	return d.manager.RefreshMount()
 }
 
 func (d *Downloader) waitForSymlinkFilesReady(filePaths []string, timeout time.Duration) error {
