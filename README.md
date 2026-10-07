@@ -61,7 +61,7 @@ For complete documentation, please visit our [Documentation](https://docs.decyph
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for this team's PR workflow and merge policy.
 
 ## License
 

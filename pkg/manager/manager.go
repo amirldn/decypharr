@@ -111,6 +111,13 @@ type Manager struct {
 	downloadTasks    sync.WaitGroup
 	downloadsStopped bool
 	cancelDownloads  context.CancelFunc
+	// cacheWarmGate is a Manager-wide slot limiter so overlapping season packs
+	// cannot each open the configured max cache-warm TorBox reads at once.
+	cacheWarmOnce sync.Once
+	cacheWarmGate *cacheWarmGate
+	// warmOneFileFn, when set, replaces warmOneFile. Tests use it to observe
+	// concurrency without touching the mount.
+	warmOneFileFn func(ctx context.Context, path string) error
 
 	// Notifications service
 	Notifications *notifications.Service
@@ -595,7 +602,7 @@ func (m *Manager) Reset() error {
 
 	// Stop resources before resetting
 	if err := m.Stop(); err != nil {
-		m.logger.Warn().Err(err).Msg("Failed to stop manager during reset")
+		return fmt.Errorf("failed to stop manager during reset: %w", err)
 	}
 
 	// Reopen storage database (it was closed by Stop)

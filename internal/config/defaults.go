@@ -26,6 +26,11 @@ var (
 	DefaultAccountSyncInterval = "10m"
 	DefaultAvailableSlots      = 100 // This is for providers that does not provide available slots info
 
+	// DefaultCacheWarmWorkers caps concurrent head+tail mount reads after a
+	// download finishes. 10 (the previous hardcoded pool size) opened a
+	// TorBox 429 circuit when two season packs finished together.
+	DefaultCacheWarmWorkers = 2
+
 	DefaultRetryDelay    = 500 * time.Millisecond
 	DefaultRetryDelayMax = 30 * time.Second
 )

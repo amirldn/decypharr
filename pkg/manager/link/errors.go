@@ -107,6 +107,14 @@ var (
 	Err404 = errors.New("HTTP 404 Not Found")
 	Err429 = errors.New("HTTP 429 Too Many Requests")
 	Err503 = errors.New("HTTP 503 Service Unavailable")
+	// Err5xx is a provider/CDN 5xx other than 503 (which has its own sentinel
+	// and also covers the provider's read-proxy timeout code). Transient by
+	// nature: the link itself is not known to be bad, so it is retryable and
+	// survives for a later validation instead of poisoning the link memo.
+	Err5xx = errors.New("HTTP 5xx: provider server error")
+	// ErrLinkRejected is a 400 from the provider/CDN, which in practice means
+	// the presigned link expired or rotated rather than a malformed request.
+	ErrLinkRejected = errors.New("HTTP 400: link rejected")
 )
 
 // NewLinkError creates a new LinkError with the given error and category
@@ -138,6 +146,37 @@ func NewAccountError(err error, code string) *Error {
 	return NewLinkError(err, CategoryAccountIssue, code)
 }
 
+// SlowStreamError is returned by the stream watchdog (see pkg/manager) when a
+// link serves bytes far below a usable rate for a sustained window. The
+// stream is alive — no error, no stall — just unusably slow, so it classifies
+// as refetchable: the session swaps to a fresh link instead of crawling until
+// the next scheduled refresh.
+type SlowStreamError struct {
+	Err   *Error
+	Host  string  // CDN host that served the degraded stream
+	Bytes int64   // bytes read before the swap was triggered
+	Bps   float64 // measured throughput in bytes/sec across the slow windows
+}
+
+// NewSlowStreamError builds a refetchable slow-stream error carrying the
+// measurements the host cooldown and the swap logging need.
+func NewSlowStreamError(host string, bytes int64, bps float64) *SlowStreamError {
+	return &SlowStreamError{
+		Err: NewRefetchableError(
+			fmt.Errorf("slow stream from %s: %.1f kB/s sustained", host, bps/1024),
+			"slow_stream",
+		),
+		Host:  host,
+		Bytes: bytes,
+		Bps:   bps,
+	}
+}
+
+func (e *SlowStreamError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the link taxonomy so errors.As finds the *Error.
+func (e *SlowStreamError) Unwrap() error { return e.Err }
+
 // ErrorCodeToLinkError converts an error code string to a LinkError with appropriate category
 func ErrorCodeToLinkError(code string) *Error {
 	switch code {
@@ -157,10 +196,30 @@ func ErrorCodeToLinkError(code string) *Error {
 		return NewPermanentError(Err404, code)
 	case "429":
 		return NewRetryableError(Err429, code)
+	// Some providers (TorBox) return a bare 400 for a presigned link that has
+	// expired or rotated. ClassifyStreamStatus already treats 400 at the CDN
+	// layer as refetchable; the provider-API path must agree, otherwise a stale
+	// link is classified permanent, fast-trips the VFS circuit breaker
+	// (errorCount = maxErrorCount) and the file reads 0 bytes until cooldown
+	// instead of simply refetching the link.
+	case "400":
+		return NewRefetchableError(ErrLinkRejected, code)
+	// 5xx responses are provider/CDN failures, not evidence about the link:
+	// the same cached link usually validates once the provider recovers. They
+	// must never be memoised as permanent (see fetchAndValidate): a single
+	// transient 502 would otherwise read as a dead file until restart, which
+	// is exactly upstream #369's defect class.
+	case "500", "502", "504":
+		return NewRetryableError(Err5xx, code)
 	case "503", "read_pxy_timeout":
 		return NewRetryableError(Err503, code)
 	default:
-		return NewPermanentError(fmt.Errorf("unknown error code: %s", code), code)
+		// An unrecognised code is not evidence of a permanent failure:
+		// providers add codes over time, and the old default (permanent)
+		// turned one unclassified response into a file that stays dead until
+		// restart. Match ClassifyTransportError's stance — a wrong "retryable"
+		// costs a bounded revalidation, a wrong "permanent" kills playback.
+		return NewRetryableError(fmt.Errorf("unknown error code: %s", code), code)
 	}
 }
 

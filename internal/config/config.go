@@ -288,9 +288,12 @@ type Config struct {
 	CallbackURL string `json:"callback_url,omitempty"`
 
 	// Manager settings
-	DownloadFolder        string                   `json:"download_folder,omitempty"`
-	RefreshInterval       string                   `json:"refresh_interval,omitempty"`
-	MaxActiveDownloads    int                      `json:"max_active_downloads,omitempty"`
+	DownloadFolder     string `json:"download_folder,omitempty"`
+	RefreshInterval    string `json:"refresh_interval,omitempty"`
+	MaxActiveDownloads int    `json:"max_active_downloads,omitempty"`
+	// MaxCacheWarmWorkers is the process-wide cap on concurrent cache-warm
+	// file reads after a download finishes. 0 = DefaultCacheWarmWorkers.
+	MaxCacheWarmWorkers   int                      `json:"max_cache_warm_workers,omitempty"`
 	SkipPreCache          bool                     `json:"skip_pre_cache,omitempty"`
 	SkipMultiSeason       bool                     `json:"skip_multi_season,omitempty"`
 	AlwaysRmTrackerUrls   bool                     `json:"always_rm_tracker_urls,omitempty"`
@@ -554,6 +557,9 @@ func (c *Config) setDefaults() {
 	if c.MaxActiveDownloads <= 0 {
 		c.MaxActiveDownloads = 5
 	}
+	if c.MaxCacheWarmWorkers <= 0 {
+		c.MaxCacheWarmWorkers = DefaultCacheWarmWorkers
+	}
 
 	for i, debrid := range c.Debrids {
 		c.Debrids[i] = c.updateDebrid(debrid)
@@ -780,6 +786,7 @@ func clearHotFields(c *Config) {
 	c.MaxFileSize = ""
 	c.NZBUserAgent = ""
 	c.DownloadFolder = ""
+	c.MaxCacheWarmWorkers = 0
 	c.SkipPreCache = false
 	c.SkipMultiSeason = false
 	c.AlwaysRmTrackerUrls = false
