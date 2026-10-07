@@ -24,6 +24,7 @@ type shutdownMount struct {
 
 func (m shutdownMount) Stop() error            { return m.stop() }
 func (m shutdownMount) Refresh([]string) error { return nil }
+func (m shutdownMount) IsReady() bool          { return true }
 
 type completedTorrentProvider struct {
 	debrid.Client
