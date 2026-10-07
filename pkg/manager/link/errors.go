@@ -151,6 +151,16 @@ func ErrorCodeToLinkError(code string) *Error {
 		return NewPermanentError(ErrFileNotAvailable, code)
 	case "invalid_download_code":
 		return NewRefetchableError(ErrInvalidDownloadCode, code)
+	case "400":
+		// A bare 400 from the provider's download-link endpoint means the
+		// presigned link was expired or rotated, not that the file is gone —
+		// verified against TorBox: a fresh requestdl link serves 206 for the
+		// same file that 400s. Treat it the same way ClassifyStreamStatus
+		// already treats a 400 at the CDN layer, so validateLink refetches
+		// instead of fast-tripping the circuit breaker (countErrors jumps
+		// straight to maxErrorCount on a permanent error, and fetchAndValidate
+		// memoizes the failure until ShouldRefetch clears it).
+		return NewRefetchableError(fmt.Errorf("HTTP 400: link rejected"), code)
 	case "401", "unauthorized":
 		return NewPermanentError(ErrUnauthorized, code)
 	case "404":
