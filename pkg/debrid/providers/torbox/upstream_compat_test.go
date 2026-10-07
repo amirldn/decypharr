@@ -6,17 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 
-	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
-
 
 func TestSubmissionRequestsUseDedicatedClient(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
@@ -53,7 +50,8 @@ func TestSubmissionRequestsUseDedicatedClient(t *testing.T) {
 	)
 
 	torrent := &types.Torrent{
-		Magnet: &utils.Magnet{Link: "magnet:?xt=urn:btih:ABC"},
+		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:ABC"},
+		DownloadUncached: true,
 	}
 	added, err := tb.SubmitMagnet(torrent)
 	if err != nil {
@@ -69,7 +67,6 @@ func TestSubmissionRequestsUseDedicatedClient(t *testing.T) {
 		t.Fatalf("request lanes = %v, want dedicated submission lane", lanes)
 	}
 }
-
 
 func TestGetTorrentAcceptsObjectAndArrayResponses(t *testing.T) {
 	tests := map[string]string{
@@ -95,7 +92,6 @@ func TestGetTorrentAcceptsObjectAndArrayResponses(t *testing.T) {
 		})
 	}
 }
-
 
 func TestDeleteTorrentUsesControlEndpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +121,6 @@ func TestDeleteTorrentUsesControlEndpoint(t *testing.T) {
 		t.Fatalf("DeleteTorrent() error = %v", err)
 	}
 }
-
 
 func TestAvailabilityPreservesKeysAndReportsIncompleteBatches(t *testing.T) {
 	calls := 0
@@ -157,4 +152,3 @@ func TestAvailabilityPreservesKeysAndReportsIncompleteBatches(t *testing.T) {
 		t.Fatal("failed batch reported a result")
 	}
 }
-

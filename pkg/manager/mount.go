@@ -2,7 +2,6 @@ package manager
 
 import (
 	"context"
-	"github.com/sirrobot01/decypharr/internal/config"
 	"io"
 	"os"
 	"strings"
@@ -64,8 +63,8 @@ func (m *Manager) RefreshMount() error {
 // cacheWarmMaxWorkers returns the process-wide cache-warm slot cap from
 // config, falling back to DefaultCacheWarmWorkers when unset.
 func (m *Manager) cacheWarmMaxWorkers() int {
-	if m != nil && m.config != nil && m.config.MaxCacheWarmWorkers > 0 {
-		return m.config.MaxCacheWarmWorkers
+	if m != nil && m.config != nil && config.Get().MaxCacheWarmWorkers > 0 {
+		return config.Get().MaxCacheWarmWorkers
 	}
 	return config.DefaultCacheWarmWorkers
 }

@@ -344,6 +344,9 @@ func New(options ...ClientOption) *Client {
 			if resp.Header != nil && numTries > 0 {
 				resp.Header.Set("X-Decypharr-Attempts", strconv.Itoa(numTries))
 			}
+			if err == nil {
+				err = fmt.Errorf("giving up after %d attempt(s)", numTries)
+			}
 			return resp, err
 		}
 		if err == nil {

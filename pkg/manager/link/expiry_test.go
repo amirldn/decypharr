@@ -25,7 +25,7 @@ type expiringClient struct {
 	deleted, calls int
 }
 
-func (c *expiringClient) GetDownloadLink(_ string, _ *types.File) (types.DownloadLink, error) {
+func (c *expiringClient) GetDownloadLink(_ context.Context, _ string, _ *types.File) (types.DownloadLink, error) {
 	c.calls++
 	if c.deleted > 0 {
 		return c.fresh, nil

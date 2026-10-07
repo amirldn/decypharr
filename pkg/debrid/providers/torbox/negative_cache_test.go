@@ -212,7 +212,10 @@ func TestIsAvailableNegativeCacheFastSkip(t *testing.T) {
 	tb.negativeCache.Put("UNCACHEDHASH", "DOWNLOAD_NOT_CACHED", 0)
 
 	// Check IsAvailable for UNCACHEDHASH alone -> 0 wire calls made
-	res1 := tb.IsAvailable([]string{"UNCACHEDHASH"})
+	res1, err := tb.IsAvailable([]string{"UNCACHEDHASH"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if res1["UNCACHEDHASH"] {
 		t.Fatal("expected UNCACHEDHASH to be unavailable")
 	}
@@ -221,7 +224,10 @@ func TestIsAvailableNegativeCacheFastSkip(t *testing.T) {
 	}
 
 	// Check IsAvailable for AVAILABLEHASH -> 1 wire call made, returns true
-	res2 := tb.IsAvailable([]string{"AVAILABLEHASH"})
+	res2, err := tb.IsAvailable([]string{"AVAILABLEHASH"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !res2["AVAILABLEHASH"] {
 		t.Fatal("expected AVAILABLEHASH to be available")
 	}

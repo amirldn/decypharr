@@ -1,6 +1,7 @@
 package account
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ func newTestAccount(debrid string) *Account {
 }
 
 func countingFetcher(url string, expiresAt time.Time, calls *int) LinkFetcher {
-	return func(_ *Account, _ string, file *types.File) (types.DownloadLink, error) {
+	return func(_ context.Context, _ *Account, _ string, file *types.File) (types.DownloadLink, error) {
 		*calls++
 		return types.DownloadLink{
 			Filename:     file.Name,
@@ -42,7 +43,7 @@ func TestGetDownloadLinkServesCachedLinkThatIsStillValid(t *testing.T) {
 	})
 
 	calls := 0
-	dl, err := acc.GetDownloadLink("1", file, countingFetcher("https://cdn.example.com/fresh", time.Now().Add(time.Hour), &calls))
+	dl, err := acc.GetDownloadLink(t.Context(), "1", file, countingFetcher("https://cdn.example.com/fresh", time.Now().Add(time.Hour), &calls))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,7 +68,7 @@ func TestGetDownloadLinkEvictsExpiredCachedLink(t *testing.T) {
 	})
 
 	calls := 0
-	dl, err := acc.GetDownloadLink("1", file, countingFetcher("https://cdn.example.com/fresh", time.Now().Add(time.Hour), &calls))
+	dl, err := acc.GetDownloadLink(t.Context(), "1", file, countingFetcher("https://cdn.example.com/fresh", time.Now().Add(time.Hour), &calls))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -101,7 +102,7 @@ func TestGetDownloadLinkKeepsCachedLinkWithoutExpiry(t *testing.T) {
 	})
 
 	calls := 0
-	dl, err := acc.GetDownloadLink("1", file, countingFetcher("https://cdn.example.com/fresh", time.Time{}, &calls))
+	dl, err := acc.GetDownloadLink(t.Context(), "1", file, countingFetcher("https://cdn.example.com/fresh", time.Time{}, &calls))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

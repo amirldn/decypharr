@@ -22,12 +22,12 @@ import (
 
 // Standard defaults for the Submission Mediator
 const (
-	DefaultCachedCheckRate       = 240.0 / 60.0       // 240 req/min (4.0/s), TorBox cap: 300/min
-	DefaultUncachedCreateRate    = 45.0 / 3600.0      // 45 req/hour (0.0125/s), TorBox cap: 60/hr
-	DefaultMaxQueueDepth         = 500
-	DefaultMediatorRampSeconds   = 300                // 5 minutes linear relaxation
-	DefaultFloorMultiplier       = 0.20               // 20% floor after 429
-	DefaultQueueJournalFilename  = "submission_queue.jsonl"
+	DefaultCachedCheckRate      = 240.0 / 60.0  // 240 req/min (4.0/s), TorBox cap: 300/min
+	DefaultUncachedCreateRate   = 45.0 / 3600.0 // 45 req/hour (0.0125/s), TorBox cap: 60/hr
+	DefaultMaxQueueDepth        = 500
+	DefaultMediatorRampSeconds  = 300  // 5 minutes linear relaxation
+	DefaultFloorMultiplier      = 0.20 // 20% floor after 429
+	DefaultQueueJournalFilename = "submission_queue.jsonl"
 )
 
 var (
@@ -687,6 +687,7 @@ func (m *SubmissionMediator) CheckCached(ctx context.Context, hashes []string) (
 		}
 		// Skip known negative-cached hashes
 		if _, found := m.negativeCache.Get(h); found {
+			result[h] = false
 			continue
 		}
 		validHashes = append(validHashes, h)
@@ -701,8 +702,12 @@ func (m *SubmissionMediator) CheckCached(ctx context.Context, hashes []string) (
 		return nil, err
 	}
 
-	// Execute check
-	return m.tb.executeCheckCached(validHashes)
+	// Preserve v2.6 availability results, including confirmed negatives and partial batches.
+	checked, err := m.tb.executeCheckCached(validHashes)
+	for hash, available := range checked {
+		result[hash] = available
+	}
+	return result, err
 }
 
 // LogTelemetry emits the structured status line defined in spec Section 7.1.

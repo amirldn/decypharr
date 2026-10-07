@@ -265,3 +265,30 @@ func TestMediatorTelemetryLogging(t *testing.T) {
 	mediator.LogTelemetry(event)
 	// Passes without panicking
 }
+
+func TestMediatorAvailabilityPreservesConfirmedNegatives(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"AVAILABLEHASH":{"size":100}}}`)
+	}))
+	defer server.Close()
+	tb := testTorbox(server.URL)
+	nc := NewNegativeCache(time.Minute, 100)
+	nc.Put("UNCACHEDHASH", "DOWNLOAD_NOT_CACHED", 0)
+	mediator, err := NewSubmissionMediator(tb, config.Debrid{Name: "torbox"}, nc, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb.mediator = mediator
+	got, err := tb.IsAvailable([]string{"UNCACHEDHASH", "availablehash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := got["UNCACHEDHASH"]; !ok || value {
+		t.Fatalf("confirmed negative missing: %#v", got)
+	}
+	if !got["availablehash"] {
+		t.Fatalf("input spelling or available result lost: %#v", got)
+	}
+}

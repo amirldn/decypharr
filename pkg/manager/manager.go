@@ -526,6 +526,7 @@ func (m *Manager) Start(ctx context.Context) error {
 
 // Stop stops the manager and cleans up all resources
 func (m *Manager) Stop() error {
+	var stopErr error
 	m.logger.Info().Msg("Stopping manager")
 	m.downloadMu.Lock()
 	m.downloadsStopped = true
@@ -558,6 +559,7 @@ func (m *Manager) Stop() error {
 		m.logger.Info().Msg("Stopping mount manager")
 		if err := m.mountManager.Stop(); err != nil {
 			m.logger.Warn().Err(err).Msg("Failed to stop mount manager")
+			stopErr = fmt.Errorf("failed to stop mount manager: %w", err)
 		}
 	}
 	if m.repair != nil {
@@ -591,8 +593,8 @@ func (m *Manager) Stop() error {
 		}
 	}
 
-	m.logger.Info().Msg("Manager stopped successfully")
-	return nil
+	m.logger.Info().Msg("Manager stopped")
+	return stopErr
 }
 
 // Reset resets the manager with the new configuration

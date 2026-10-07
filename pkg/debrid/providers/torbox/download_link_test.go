@@ -51,7 +51,7 @@ func TestPlaybackStoresCDNAndCapsExpiry(t *testing.T) {
 			tb := playbackTorbox(t, server.URL, tc.configured)
 			file := &types.File{Id: "2", Link: "torbox://1/2", Name: "movie", Size: 20}
 			// The repair/health probe must not spend a requestdl admission.
-			probe, err := tb.GetDownloadLink("1", file)
+			probe, err := tb.GetDownloadLink(t.Context(), "1", file)
 			if err != nil || probe.Empty() || calls.Load() != 0 {
 				t.Fatalf("probe: %v, calls=%d", err, calls.Load())
 			}
@@ -66,7 +66,7 @@ func TestPlaybackStoresCDNAndCapsExpiry(t *testing.T) {
 			if got := dl.ExpiresAt.Sub(start); got < tc.want-time.Second || got > tc.want+time.Second {
 				t.Fatalf("expiry=%s, want %s", got, tc.want)
 			}
-			cached, err := tb.GetDownloadLink("1", file)
+			cached, err := tb.GetDownloadLink(t.Context(), "1", file)
 			if err != nil || cached.DownloadLink != dl.DownloadLink || calls.Load() != 1 {
 				t.Fatalf("cache=%q, err=%v, calls=%d", cached.DownloadLink, err, calls.Load())
 			}
@@ -118,7 +118,7 @@ func TestPlaybackRejectsBadRequestdlResponseWithoutCaching(t *testing.T) {
 			if calls.Load() != 1 {
 				t.Fatalf("resolution made %d requestdl calls", calls.Load())
 			}
-			cached, err := tb.GetDownloadLink("1", file)
+			cached, err := tb.GetDownloadLink(t.Context(), "1", file)
 			if err != nil || strings.Contains(cached.DownloadLink, "cdn") {
 				t.Fatalf("cached=%q, err=%v", cached.DownloadLink, err)
 			}

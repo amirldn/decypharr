@@ -777,13 +777,13 @@ func (d *Downloader) localDownloadAttempt(download types.DownloadLink, filename 
 	client.BufferSize = 1 << 20
 	client.HTTPClient = d.manager.streamClient
 	if d.manager.clients != nil {
- if provider, ok := d.manager.clients.Load(download.Debrid); ok {
-		if p, ok := provider.(request.ThrottleProvider); ok && p.RequestThrottle() != nil {
-			client.HTTPClient = throttledDownloadClient{client: d.manager.streamClient, gate: p.RequestThrottle()}
+		if provider, ok := d.manager.clients.Load(download.Debrid); ok {
+			if p, ok := provider.(request.ThrottleProvider); ok && p.RequestThrottle() != nil {
+				client.HTTPClient = throttledDownloadClient{client: d.manager.streamClient, gate: p.RequestThrottle()}
+			}
 		}
-	}
 
- }
+	}
 	resp := client.Do(req)
 	if resp == nil {
 		return fmt.Errorf("grab returned nil response for %s", downloadURL)
@@ -916,7 +916,14 @@ func (d *Downloader) logDownloadCompletion(filename string, startTime time.Time,
 
 // Retain the URL-only helper for callers without provider metadata.
 func (d *Downloader) localDownloader(downloadURL, filename string, byterange *[2]int64, progressCallback func(int64, int64)) error {
- return d.localDownloaderWithLink(types.DownloadLink{DownloadLink: downloadURL}, filename, byterange, progressCallback)
+	return d.localDownloaderWithLink(types.DownloadLink{DownloadLink: downloadURL}, filename, byterange, progressCallback)
 }
-type throttledDownloadClient struct { client *http.Client; gate *request.Throttle }
-func (c throttledDownloadClient) Do(req *http.Request) (*http.Response,error) { return c.gate.Do(c.client,req) }
+
+type throttledDownloadClient struct {
+	client *http.Client
+	gate   *request.Throttle
+}
+
+func (c throttledDownloadClient) Do(req *http.Request) (*http.Response, error) {
+	return c.gate.Do(c.client, req)
+}
