@@ -75,6 +75,11 @@ func (c *Config) applyEnvOverrides() {
 			c.MaxActiveDownloads = v
 		}
 	}
+	if val := getEnv("MAX_CACHE_WARM_WORKERS"); val != "" {
+		if v, err := strconv.Atoi(val); err == nil {
+			c.MaxCacheWarmWorkers = v
+		}
+	}
 	if val := getEnv("SKIP_PRE_CACHE"); val != "" {
 		c.SkipPreCache = parseBool(val)
 	}

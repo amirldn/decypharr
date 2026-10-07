@@ -130,6 +130,9 @@ type Stats struct {
 	Library         LibraryStats     `json:"library"`
 	Accounts        []map[string]any `json:"accounts"`
 	SpeedTestResult *SpeedTestResult `json:"speed_test_result,omitempty"`
+	// Requestdl is the shared /requestdl budget snapshot for providers that
+	// expose one (per-class counts, current rate, queue depth, penalties).
+	Requestdl any `json:"requestdl,omitempty"`
 }
 
 type Profile struct {
@@ -166,6 +169,13 @@ func (dl *DownloadLink) Valid() error {
 	}
 
 	return nil
+}
+
+// Expired reports whether the link is past the expiry the provider (or
+// auto_expire_links_after) gave it. Providers that don't expose an expiry leave
+// ExpiresAt zero; those links are never considered expired.
+func (dl *DownloadLink) Expired() bool {
+	return !dl.ExpiresAt.IsZero() && time.Now().After(dl.ExpiresAt)
 }
 
 func (dl *DownloadLink) Empty() bool {

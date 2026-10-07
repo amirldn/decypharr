@@ -313,7 +313,7 @@ class TorrentDashboard {
                         <span class="text-sm">${torrent.num_seeds || 0}</span>
                     </td>
                     <td>
-                        ${this.renderStateBadge(torrent.state)}
+                        ${this.renderStateBadge(torrent.state, torrent.last_error)}
                     </td>
                     <td>
                         <button class="btn btn-ghost btn-xs text-error"
@@ -347,7 +347,7 @@ class TorrentDashboard {
         `;
     }
 
-    renderStateBadge(state) {
+    renderStateBadge(state, lastError = '') {
         const stateMap = {
             'pausedUP': {class: 'badge-success', text: 'Completed'},
             'downloading': {class: 'badge-info', text: 'Downloading'},
@@ -357,7 +357,10 @@ class TorrentDashboard {
         };
 
         const s = stateMap[state] || {class: 'badge-ghost', text: state};
-        return `<span class="badge ${s.class} badge-sm">${s.text}</span>`;
+        const errorDetail = state === 'error' && lastError
+            ? `<span class="block max-w-64 break-words text-xs text-error">${this.escapeHtml(lastError)}</span>`
+            : '';
+        return `<span class="badge ${s.class} badge-sm">${s.text}</span>${errorDetail}`;
     }
 
     renderProtocolBadge(protocol) {

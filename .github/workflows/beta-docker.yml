@@ -11,13 +11,13 @@ permissions:
 
 env:
   DOCKERHUB_IMAGE: cy01/blackhole
-  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/decypharr
 
 jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
       beta_version: ${{ steps.calculate_version.outputs.beta_version }}
+      ghcr_image: ${{ steps.calculate_version.outputs.ghcr_image }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -38,8 +38,11 @@ jobs:
           NEW_PATCH=$((PATCH + 1))
           BETA_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
 
+          GHCR_IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
           echo "Calculated beta version: ${BETA_VERSION}"
           echo "beta_version=${BETA_VERSION}" >> $GITHUB_OUTPUT
+          echo "ghcr_image=${GHCR_IMAGE}" >> $GITHUB_OUTPUT
 
   build:
     needs: prepare
@@ -100,7 +103,7 @@ jobs:
             VERSION=${{ needs.prepare.outputs.beta_version }}
             CHANNEL=beta
           cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
-          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ needs.prepare.outputs.ghcr_image }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digests
         run: |
@@ -131,7 +134,7 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: build
+    needs: [ prepare, build ]
     runs-on: ubuntu-latest
     steps:
       - name: Download Docker Hub digests
@@ -175,5 +178,5 @@ jobs:
         working-directory: /tmp/digests/ghcr
         run: |
           docker buildx imagetools create \
-            --tag ${{ env.GHCR_IMAGE }}:beta \
-            $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
+            --tag ${{ needs.prepare.outputs.ghcr_image }}:beta \
+            $(printf '${{ needs.prepare.outputs.ghcr_image }}@sha256:%s ' *)

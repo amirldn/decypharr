@@ -15,6 +15,13 @@ func (m *Manager) GetDownloadLink(ctx context.Context, entry *storage.Entry, fil
 	return m.linkService.GetLink(ctx, entry, filename)
 }
 
+// ResolveRequestdlURL follows a download link's requestdl redirect through the
+// provider's shared budget and returns the final CDN URL, so an out-of-process
+// consumer does not call /requestdl outside the budget.
+func (m *Manager) ResolveRequestdlURL(ctx context.Context, link types.DownloadLink) (string, error) {
+	return m.linkService.Resolve(ctx, link)
+}
+
 // GetDownloadByteRange gets the byte range for a file
 func (m *Manager) GetDownloadByteRange(torrentName, filename string) (*[2]int64, error) {
 	entry, err := m.storage.GetEntryItem(torrentName)

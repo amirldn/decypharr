@@ -4,11 +4,13 @@ package hanwen
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,13 +35,25 @@ func init() {
 	backend.Register(backend.Hanwen, NewBackend)
 }
 
-// Backend implements the hanwen/go-fuse backend
+type mountedServer interface {
+	Unmount() error
+	WaitMount() error
+}
+
+type mountFilesystem func(string, fs.InodeEmbedder, *fs.Options) (mountedServer, error)
+
+// Backend implements the hanwen/go-fuse backend.
 type Backend struct {
 	config      *config.FuseConfig
 	logger      zerolog.Logger
-	server      *fuse.Server
+	server      mountedServer
 	ready       atomic.Bool
-	unmountFunc func(ctx context.Context)
+	unmountFunc func(ctx context.Context) error
+	lifecycleMu sync.Mutex
+	closeOnce   sync.Once
+	closeErr    error
+	closeVFSFn  func() error
+	lease       *mountLease
 	root        *Dir
 	vfs         *vfs.Manager
 }
@@ -54,16 +68,52 @@ func NewBackend(vfs *vfs.Manager, config *config.FuseConfig) (backend.Backend, e
 	rl := logger.NewRateLimitedLogger(logger.WithLogger(log))
 	root := NewDir(vfs, "", LevelRoot, uint64(now.Unix()), config, log, rl)
 	return &Backend{
-		config: config,
-		logger: log,
-		root:   root,
-		vfs:    vfs,
+		config:     config,
+		logger:     log,
+		root:       root,
+		vfs:        vfs,
+		closeVFSFn: vfs.Close,
 	}, nil
 }
 
 // Mount mounts the filesystem using hanwen/go-fuse
 func (b *Backend) Mount(ctx context.Context) error {
-	// Create mount point if it doesn't exist(skip if on Windows)
+	return b.mount(ctx, mountFuse)
+}
+
+func mountFuse(path string, root fs.InodeEmbedder, opts *fs.Options) (mountedServer, error) {
+	server, err := fs.Mount(path, root, opts)
+	if err != nil {
+		return nil, err
+	}
+	return server, nil
+}
+
+func (b *Backend) closeVFS() error {
+	b.closeOnce.Do(func() {
+		if b.closeVFSFn != nil {
+			b.closeErr = b.closeVFSFn()
+		} else if b.vfs != nil {
+			b.closeErr = b.vfs.Close()
+		}
+	})
+	return b.closeErr
+}
+
+func (b *Backend) mount(ctx context.Context, mountFS mountFilesystem) (retErr error) {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	defer func() {
+		if retErr != nil && b.unmountFunc == nil {
+			retErr = errors.Join(retErr, b.closeVFS())
+		}
+	}()
+	if b.lease != nil {
+		return fmt.Errorf("backend already used; create a new backend for a new mount")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if b.root == nil {
 		return fmt.Errorf("root node is not initialized")
@@ -72,9 +122,30 @@ func (b *Backend) Mount(ctx context.Context) error {
 		return fmt.Errorf("VFS manager is not initialized")
 	}
 
-	_ = os.MkdirAll(b.config.MountPath, 0755)
-	// Try to unmount if already mounted
-	b.forceUnmount(ctx)
+	// Inspect the mount table before stat/mkdir/alias resolution can touch
+	// an existing, possibly stalled FUSE mount.
+	absolutePath, err := filepath.Abs(b.config.MountPath)
+	if err != nil {
+		return err
+	}
+	if err := checkMountpoint(absolutePath); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(b.config.MountPath, 0755); err != nil {
+		return err
+	}
+	lease, err := acquireMount(b.config.MountPath)
+	if err != nil {
+		return err
+	}
+	b.lease = lease
+	// Use the canonical name for both the ownership key and all FUSE calls.
+	b.config.MountPath = lease.path
+	if err := checkMountpoint(lease.path); err != nil {
+		lease.startCleanup(func() error { return nil })
+		_ = lease.wait(context.Background())
+		return err
+	}
 
 	mountOpt := fuse.MountOptions{
 		FsName:               "decypharr",
@@ -126,117 +197,72 @@ func (b *Backend) Mount(ctx context.Context) error {
 
 	// Channel to receive the result of fs.Mount
 	type fsResult struct {
-		server *fuse.Server
+		server mountedServer
 		err    error
 	}
 	fsResultChan := make(chan fsResult, 1)
 
-	// Run fs.Mount in a goroutine
+	// The mount operation owns the path even if its caller times out. A
+	// late result is cleaned up before any replacement can acquire the path.
 	go func() {
-		server, err := fs.Mount(b.config.MountPath, b.root, opts)
+		server, err := mountFS(lease.path, b.root, opts)
 		fsResultChan <- fsResult{server: server, err: err}
 	}()
-
-	var server *fuse.Server
+	cleanup := func(server mountedServer) error {
+		closeErr := b.closeVFS()
+		if server != nil {
+			return errors.Join(closeErr, server.Unmount())
+		}
+		return closeErr
+	}
+	b.unmountFunc = func(ctx context.Context) error {
+		lease.startCleanup(func() error { return cleanup(b.server) })
+		return lease.wait(ctx)
+	}
+	var server mountedServer
 	select {
 	case result := <-fsResultChan:
 		server = result.server
+		b.server = server
 		if result.err != nil {
-			return fmt.Errorf("failed to create mount: %w", result.err)
+			lease.startCleanup(func() error { return cleanup(server) })
+			return errors.Join(fmt.Errorf("failed to create mount: %w", result.err), lease.wait(mountCtx))
 		}
 	case <-mountCtx.Done():
-		b.ready.Store(false)
-		// If fs.Mount later succeeds, nobody is left to read the result —
-		// unmount the orphaned server instead of leaking a live mount.
-		go func() {
-			if result := <-fsResultChan; result.server != nil {
-				_ = result.server.Unmount()
-			}
-		}()
+		lease.startCleanup(func() error {
+			result := <-fsResultChan
+			return cleanup(result.server)
+		})
 		return fmt.Errorf("timeout creating mount: %w", mountCtx.Err())
 	}
-
-	b.server = server
-
-	// Now wait for the mount to be ready with the same timeout context
-	b.logger.Info().
-		Str("mount_path", b.config.MountPath).
-		Msg("Waiting for mount to be ready")
-
+	b.logger.Info().Str("mount_path", lease.path).Msg("Waiting for mount to be ready")
 	waitChan := make(chan error, 1)
-	go func() {
-		waitChan <- server.WaitMount()
-	}()
-
+	go func() { waitChan <- server.WaitMount() }()
 	select {
 	case err := <-waitChan:
 		if err != nil {
-			_ = server.Unmount() // cleanup on error
-			return fmt.Errorf("failed to wait for mount: %w", err)
+			lease.startCleanup(func() error { return cleanup(server) })
+			return errors.Join(fmt.Errorf("failed to wait for mount: %w", err), lease.wait(mountCtx))
 		}
 	case <-mountCtx.Done():
-		_ = server.Unmount() // cleanup on timeout
+		lease.startCleanup(func() error { return cleanup(server) })
 		return fmt.Errorf("timeout waiting for mount to be ready: %w", mountCtx.Err())
 	}
-
-	umount := func(ctx context.Context) {
-		b.logger.Info().Msg("Unmounting filesystem")
-
-		// Create a channel to track completion
-		done := make(chan struct{})
-
-		go func() {
-			// Close VFS manager
-			if b.vfs != nil {
-				if err := b.vfs.Close(); err != nil {
-					b.logger.Warn().Err(err).Msg("Failed to close VFS")
-				}
-			}
-
-			_ = server.Unmount()
-			time.Sleep(1 * time.Second)
-
-			// Check if still mounted
-			if _, err := os.Stat(b.config.MountPath); err == nil {
-				b.logger.Warn().Msg("FUSE filesystem still mounted, attempting force unmount")
-				b.forceUnmount(ctx)
-			}
-
-			close(done)
-		}()
-
-		// Wait for unmount to complete or context timeout
-		select {
-		case <-done:
-			b.logger.Info().Msg("Filesystem unmounted successfully")
-		case <-ctx.Done():
-			b.logger.Warn().Err(ctx.Err()).Msg("Unmount timed out, forcing unmount")
-			b.forceUnmount(ctx)
-		}
-	}
-
-	b.unmountFunc = umount
 	b.ready.Store(true)
 	return nil
 }
 
 // Unmount unmounts the filesystem
 func (b *Backend) Unmount(ctx context.Context) error {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	b.ready.Store(false)
 	b.logger.Info().Msg("Unmounting hanwen backend")
 	if b.unmountFunc != nil {
-		// unmountFunc already closes the VFS manager as part of its teardown;
-		// don't close it a second time here.
-		b.unmountFunc(ctx)
-		return nil
+		return b.unmountFunc(ctx)
 	}
-	// Mount never completed: force-unmount and close the VFS ourselves.
-	b.forceUnmount(ctx)
-	if b.vfs != nil {
-		if err := b.vfs.Close(); err != nil {
-			b.logger.Warn().Err(err).Msg("Failed to close VFS")
-		}
-	}
-	return nil
+	// No server was started (for example the path was already mounted).
+	return b.closeVFS()
 }
 
 // WaitReady waits for the mount to be ready
@@ -265,37 +291,4 @@ func (b *Backend) Refresh(dir string) {
 			b.root.RefreshChild(dir)
 		}
 	}
-}
-
-// forceUnmount attempts to force unmount a path using system commands
-func (b *Backend) forceUnmount(ctx context.Context) {
-	methods := [][]string{
-		{"umount", b.config.MountPath},
-		{"umount", "-l", b.config.MountPath}, // lazy unmount
-		{"fusermount", "-uz", b.config.MountPath},
-		{"fusermount3", "-uz", b.config.MountPath},
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	for _, method := range methods {
-		if err := b.tryUnmountCommand(ctx, method...); err == nil {
-			return
-		}
-		if ctx.Err() != nil {
-			b.logger.Warn().Err(ctx.Err()).Msg("Unmount command timed out")
-			return
-		}
-	}
-}
-
-// tryUnmountCommand tries to run an unmount command
-func (b *Backend) tryUnmountCommand(ctx context.Context, args ...string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("no command provided")
-	}
-
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	return cmd.Run()
 }

@@ -244,6 +244,10 @@ func (c *Collector) collectDebrids(cfg *config.Config) []debridTypes.Stats {
 			ds.SpeedTestResult = &speedResult
 		}
 
+		if provider, ok := client.(interface{ RequestdlStats() any }); ok {
+			ds.Requestdl = provider.RequestdlStats()
+		}
+
 		result = append(result, ds)
 		return true
 	})

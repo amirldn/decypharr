@@ -67,15 +67,16 @@ func Start(ctx context.Context) error {
 
 		srv.SetRestartFunc(restartFunc)
 
-		resetFunc := func() {
+		resetFunc := func() error {
 
 			config.Reset()
 			// Stop manager to reset ready channel and cleanup resources
 			if err := mgr.Reset(); err != nil {
-				_log.Warn().Err(err).Msg("Failed to reset manager")
+				return fmt.Errorf("failed to reset manager: %w", err)
 			}
 			// refresh GC
 			runtime.GC()
+			return nil
 		}
 
 		shutdownFunc := func() {
@@ -105,8 +106,10 @@ func Start(ctx context.Context) error {
 			cancelSvc()
 			_log.Info().Msg("Restarting Decypharr...")
 			<-serviceResult
-			_log.Info().Msg("Decypharr has been restarted.")
-			resetFunc()
+			if err := resetFunc(); err != nil {
+				return err // Never start a replacement while old cleanup is pending.
+			}
+			_log.Info().Msg("Decypharr manager reset; starting services.")
 			svcCtx, cancelSvc = context.WithCancel(ctx)
 
 		case err := <-serviceResult:

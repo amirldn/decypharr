@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - 'v*'
 
@@ -10,31 +12,44 @@ permissions:
   packages: write
 
 env:
-  REGISTRY_GHCR: ghcr.io/sirrobot01/decypharr
-  REGISTRY_HUB: docker.io/cy01/blackhole
   LDFLAGS_PKG: github.com/sirrobot01/decypharr/pkg/version
 
 jobs:
-  # Determine release channel from tag
+  # Determine release channel and tag/version
   prepare:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
       channel: ${{ steps.meta.outputs.channel }}
+      tag: ${{ steps.meta.outputs.tag }}
+      ghcr_repo: ${{ steps.meta.outputs.ghcr_repo }}
     steps:
-      - name: Extract version and channel
+      - uses: actions/checkout@v4
+      - name: Extract version, channel, and tag
         id: meta
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#v}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          if [[ "$TAG" == *"-beta"* ]]; then
-            echo "channel=beta" >> "$GITHUB_OUTPUT"
-          elif [[ "$TAG" == *"-rc"* ]]; then
-            echo "channel=rc" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+            if [[ "$TAG" == *"-beta"* ]]; then
+              CHANNEL="beta"
+            elif [[ "$TAG" == *"-rc"* ]]; then
+              CHANNEL="rc"
+            else
+              CHANNEL="stable"
+            fi
           else
-            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            DATE=$(date -u +'%Y%m%d%H%M%S')
+            SHORT_SHA="${GITHUB_SHA::7}"
+            TAG="v3.0.0-liteflix.${DATE}.${SHORT_SHA}"
+            VERSION="3.0.0-liteflix.${DATE}.${SHORT_SHA}"
+            CHANNEL="stable"
           fi
+          GHCR_REPO="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "ghcr_repo=${GHCR_REPO}" >> "$GITHUB_OUTPUT"
 
   # Build Linux binaries (CGO required for FUSE + rapidyenc)
   build-linux:
@@ -50,7 +65,7 @@ jobs:
             cc: zig cc -target aarch64-linux-gnu
             cxx: zig c++ -target aarch64-linux-gnu
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -99,7 +114,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: prepare
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -142,7 +157,7 @@ jobs:
           - arch: arm64
             label: arm64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -175,12 +190,12 @@ jobs:
           name: darwin-${{ matrix.arch }}
           path: dist/decypharr_Darwin_*.tar.gz
 
-  # Build and push multi-platform Docker images
+  # Build and push multi-platform Docker images to GHCR
   docker:
     runs-on: ubuntu-latest
     needs: prepare
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -195,13 +210,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -212,10 +220,8 @@ jobs:
             VERSION=${{ needs.prepare.outputs.version }}
             CHANNEL=${{ needs.prepare.outputs.channel }}
           tags: |
-            ${{ env.REGISTRY_GHCR }}:${{ github.ref_name }}
-            ${{ env.REGISTRY_GHCR }}:latest
-            ${{ env.REGISTRY_HUB }}:${{ github.ref_name }}
-            ${{ env.REGISTRY_HUB }}:latest
+            ${{ needs.prepare.outputs.ghcr_repo }}:${{ needs.prepare.outputs.tag }}
+            ${{ needs.prepare.outputs.ghcr_repo }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -224,7 +230,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ prepare, build-linux, build-windows, build-darwin ]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -237,7 +243,7 @@ jobs:
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           PRERELEASE=""
@@ -248,5 +254,5 @@ jobs:
           gh release create "$TAG" dist/* \
             --title "decypharr ${TAG}" \
             --generate-notes \
-            $PRERELEASE \
-            --notes-start-tag "$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")"
+            --latest \
+            $PRERELEASE

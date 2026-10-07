@@ -34,7 +34,7 @@ type Manager struct {
 
 const noActiveWarningInterval = time.Minute
 
-func NewManager(debridConf config.Debrid, downloadRL ratelimit.Limiter, logger zerolog.Logger) *Manager {
+func NewManager(debridConf config.Debrid, downloadRL ratelimit.Limiter, logger zerolog.Logger, options ...request.ClientOption) *Manager {
 	m := &Manager{
 		debrid:   debridConf.Name,
 		accounts: xsync.NewMap[string, *Account](),
@@ -67,7 +67,7 @@ func NewManager(debridConf config.Debrid, downloadRL ratelimit.Limiter, logger z
 			Token:      token,
 			Index:      idx,
 			links:      xsync.NewMap[string, types.DownloadLink](),
-			httpClient: request.New(opts...),
+			httpClient: request.New(append(opts, options...)...),
 		}
 		m.accounts.Store(token, account)
 		if firstAccount == nil {

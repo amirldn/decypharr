@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -403,16 +404,27 @@ func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTorrentDownload(w http.ResponseWriter, r *http.Request, entry *storage.Entry, file *storage.File) {
 	// For torrents, get debrid download link and redirect
-	link, err := s.manager.GetDownloadLink(r.Context(), entry, file.Name)
+	ctx := request.WithClass(r.Context(), request.ClassPlayback)
+	link, err := s.manager.GetDownloadLink(ctx, entry, file.Name)
 	if err != nil || link.Empty() {
 		s.logger.Error().Err(err).Str("torrent", entry.Name).Str("file", file.Name).Msg("Failed to get download link")
 		http.Error(w, "Could not fetch download link", http.StatusPreconditionFailed)
 		return
 	}
 
-	w.Header().Set("X-Accel-Redirect", link.DownloadLink)
+	// Resolve the requestdl redirect server-side so the requestdl call is
+	// charged to the shared budget; the client is then sent straight to the
+	// CDN URL and never calls /requestdl itself.
+	resolved, err := s.manager.ResolveRequestdlURL(ctx, link)
+	if err != nil || resolved == "" {
+		s.logger.Error().Err(err).Str("torrent", entry.Name).Str("file", file.Name).Msg("Failed to resolve download link")
+		http.Error(w, "Could not resolve download link", http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("X-Accel-Redirect", resolved)
 	w.Header().Set("X-Accel-Buffering", "no")
-	http.Redirect(w, r, link.DownloadLink, http.StatusFound)
+	http.Redirect(w, r, resolved, http.StatusFound)
 }
 
 func (s *Server) handleUsenetDownload(w http.ResponseWriter, r *http.Request, entryName string, file *storage.File) {

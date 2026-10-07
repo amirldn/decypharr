@@ -7,11 +7,26 @@ import (
 )
 
 type Debrid struct {
-	Provider                     string   `json:"provider,omitempty"` // realdebrid, alldebrid, debridlink, torbox, premiumize
+	TorboxBackoffMax             string   `json:"torbox_backoff_max,omitempty"`
+	TorboxBreakerThreshold       int      `json:"torbox_breaker_threshold,omitempty"`
+	TorboxBreakerCooldown        string   `json:"torbox_breaker_cooldown,omitempty"`
+	TorboxReadWaitMax            string   `json:"torbox_read_wait_max,omitempty"`
+	TorboxNegativeCacheTTL       string   `json:"torbox_negative_cache_ttl,omitempty"`
+	TorboxNegativeCacheMax       int      `json:"torbox_negative_cache_max,omitempty"`
+	TorboxSubmissionEnabled      *bool    `json:"torbox_submission_enabled,omitempty"`
+	TorboxCachedCheckRate        string   `json:"torbox_cached_check_rate,omitempty"`
+	TorboxUncachedCreateRate     string   `json:"torbox_uncached_create_rate,omitempty"`
+	TorboxMaxQueueDepth          int      `json:"torbox_max_queue_depth,omitempty"`
+	TorboxMediatorRampSeconds    int      `json:"torbox_mediator_ramp_seconds,omitempty"`
+	TorboxQueueJournalPath       string   `json:"torbox_queue_journal_path,omitempty"`
+	RequestdlBudget              string   `json:"requestdl_budget,omitempty"`       // e.g. 12/minute
+	RequestdlRampSeconds         int      `json:"requestdl_ramp_seconds,omitempty"` // post-penalty ramp, default 300
+	RequestdlFreezeMax           string   `json:"requestdl_freeze_max,omitempty"`   // raw Retry-After ceiling for the bucket, default 48h
+	Provider                     string   `json:"provider,omitempty"`               // realdebrid, alldebrid, debridlink, torbox, premiumize
 	Name                         string   `json:"name,omitempty"`
 	APIKey                       string   `json:"api_key,omitempty"`
 	DownloadAPIKeys              []string `json:"download_api_keys,omitempty"`
-	DownloadUncached             bool     `json:"download_uncached,omitempty"`
+	DownloadUncached             *bool    `json:"download_uncached,omitempty"`
 	RateLimit                    string   `json:"rate_limit,omitempty"` // 200/minute or 10/second
 	RepairRateLimit              string   `json:"repair_rate_limit,omitempty"`
 	DownloadRateLimit            string   `json:"download_rate_limit,omitempty"`
@@ -35,6 +50,20 @@ type Debrid struct {
 
 	// Directories
 	Directories map[string]WebdavDirectories `json:"directories,omitempty"` // Deprecated. Use global setting instead.
+}
+
+// DownloadsUncached resolves the tri-state download_uncached setting. A nil
+// value means the key is absent from config.json and keeps the historical
+// default: false (only cached torrents may be imported). Explicit true/false
+// values are persisted as-is; the field is *bool so an explicit false survives
+// a save round-trip instead of being stripped by omitempty.
+func (d Debrid) DownloadsUncached() bool {
+	return d.DownloadUncached != nil && *d.DownloadUncached
+}
+
+// SubmissionEnabled returns true if the TorBox submission mediator is enabled (default true).
+func (d Debrid) SubmissionEnabled() bool {
+	return d.TorboxSubmissionEnabled == nil || *d.TorboxSubmissionEnabled
 }
 
 func (c *Config) updateDebrid(d Debrid) Debrid {
