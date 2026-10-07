@@ -274,16 +274,19 @@ func (m *Manager) processQueuedTorrent(entry *storage.Entry) {
 
 	dbT, err := client.CheckStatus(debridTorrent)
 	if err != nil {
-		m.logger.Error().Err(err).Str("name", entry.Name).Msg("Error checking status")
+		if dbT != nil {
+			applyDebridTorrentToEntry(entry, dbT)
+		}
+		log := m.logger.Error().Err(err).
+			Str("name", entry.Name).
+			Str("infohash", entry.InfoHash).
+			Str("category", entry.Category)
+		if placement := entry.GetActiveProvider(); placement != nil {
+			log = log.Str("debrid", placement.Provider).Str("debrid_id", placement.ID)
+		}
+		log.Msg("Error checking status")
 		entry.MarkAsError(err)
 		_ = m.queue.Update(entry)
-
-		// Delete from debrid on error
-		go func() {
-			if dbT != nil && dbT.Id != "" {
-				_ = client.DeleteTorrent(dbT.Id)
-			}
-		}()
 		return
 	}
 
@@ -318,6 +321,8 @@ func (m *Manager) processQueuedTorrent(entry *storage.Entry) {
 	if placement := entry.GetActiveProvider(); placement != nil {
 		placement.Progress = entry.Progress
 	}
+
+	applyDebridTorrentToEntry(entry, debridTorrent)
 
 	_ = m.queue.Update(entry)
 	// Check if done or failed
@@ -394,11 +399,21 @@ func (m *Manager) processNewTorrent(torrent *storage.Entry, debridTorrent *debri
 func applyDebridTorrentToEntry(torrent *storage.Entry, debridTorrent *debridTypes.Torrent) {
 	_ = torrent.AddTorrentProvider(debridTorrent)
 	torrent.ActiveProvider = debridTorrent.Debrid
-	torrent.Bytes = debridTorrent.GetSize()
-	torrent.Size = debridTorrent.GetSize()
-	torrent.Name = debridTorrent.Name
-	torrent.OriginalFilename = debridTorrent.OriginalFilename
+	if debridTorrent.GetSize() > 0 {
+		torrent.Bytes = debridTorrent.GetSize()
+		torrent.Size = debridTorrent.GetSize()
+	}
+	if debridTorrent.Name != "" {
+		torrent.Name = debridTorrent.Name
+	}
+	if debridTorrent.OriginalFilename != "" {
+		torrent.OriginalFilename = debridTorrent.OriginalFilename
+	}
 	torrent.UpdatedAt = time.Now()
+
+	if torrent.Files == nil {
+		torrent.Files = make(map[string]*storage.File)
+	}
 
 	for _, file := range debridTorrent.Files {
 		tFile := &storage.File{
@@ -451,7 +466,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		if importRequest.DownloadUncached != nil {
 			overrideDownloadUncached = *importRequest.DownloadUncached
 		} else {
-			overrideDownloadUncached = db.Config().DownloadUncached
+			overrideDownloadUncached = db.Config().DownloadsUncached()
 		}
 		debridTorrent.DownloadUncached = overrideDownloadUncached
 

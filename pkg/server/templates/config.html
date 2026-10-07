@@ -403,6 +403,14 @@
                                 </button>
                                 <span class="text-sm opacity-70 block mt-1">Rebuilds the whole .strm tree in the background; progress is logged</span>
                             </div>
+                            <div>
+                                <label class="label" for="max_cache_warm_workers">
+                                    <span class="font-medium">Max Cache Warm Workers</span>
+                                </label>
+                                <input type="number" class="input w-full" name="max_cache_warm_workers"
+                                       id="max_cache_warm_workers" min="1" placeholder="2">
+                                <span class="text-sm opacity-70">Concurrent head+tail cache-warm reads after a download. Season packs (4+ files) always warm one at a time. Default 2.</span>
+                            </div>
                         </div>
                     </div>
                     </div>

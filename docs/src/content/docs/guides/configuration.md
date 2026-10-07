@@ -73,11 +73,14 @@ variables:
 
 ```json
 {
-  "max_active_downloads": 5
+  "max_active_downloads": 5,
+  "max_cache_warm_workers": 2
 }
 ```
 
 `max_active_downloads` is the shared active-processing limit for torrent and NZB downloads. Additional imports remain queued until an active download completes.
+
+`max_cache_warm_workers` caps how many media files Decypharr reads at once (head + tail, 2 MB each) after a download finishes, to warm the mount cache before an import probe. Default is `2`. Season packs with 4 or more media files always warm one file at a time. Overlapping packs share the same budget, so two packs finishing together cannot stack past this cap. Set `skip_pre_cache` to disable warming entirely.
 
 ## Debrid Providers
 

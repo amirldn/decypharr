@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
@@ -21,6 +24,16 @@ const (
 	MaxReinsertionAttempt = 3
 	// maxValidatedEntries caps the validated-link memo map (see GetLink).
 	maxValidatedEntries = 8192
+	// slowHostCooldown is how long a CDN host that served a degraded stream
+	// is deprioritized when fetching fresh links. Long enough to outlast a
+	// transient bad node, short enough to forgive a recovered one.
+	slowHostCooldown = 30 * time.Minute
+	// maxCooldownHosts caps the slow-host map; resetting merely costs
+	// re-learning which hosts are slow.
+	maxCooldownHosts = 256
+	// maxCooldownSkips bounds how many freshly dealt links are discarded for
+	// pointing at cooling hosts before falling back to the last one dealt.
+	maxCooldownSkips = 3
 )
 
 var (
@@ -36,6 +49,7 @@ type EntrySaver func(entry *storage.Entry) error
 // It uses the account-level cache for storing links and only tracks validation state.
 type Service struct {
 	validated      *xsync.Map[string, error]
+	cooldowns      *xsync.Map[string, time.Time]
 	singleflight   singleflight.Group
 	clients        *xsync.Map[string, debrid.Client]
 	entryRefresher EntryRefresher
@@ -58,6 +72,7 @@ func New(
 ) *Service {
 	return &Service{
 		validated:      xsync.NewMap[string, error](),
+		cooldowns:      xsync.NewMap[string, time.Time](),
 		clients:        clients,
 		entryRefresher: entryRefresher,
 		repairer:       entryReinsert,
@@ -123,10 +138,29 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 		return s.handleBadLink(ctx, err, entry, link, attempt)
 	}
 
+	// A link we already know is expired cannot be validated back to life: the
+	// HEAD below would burn the whole retry ladder before landing in
+	// invalidateAndRefetch anyway. Refetch first, then validate the fresh link
+	// once through the normal path.
+	if link.Expired() && link.Debrid != "" {
+		fresh, refetchErr := s.invalidateAndRefetch(ctx, entry, link, attempt)
+		if refetchErr != nil {
+			return fresh, refetchErr
+		}
+		link = fresh
+	}
+
 	// Is link already validated
 	// Check if we've already validated this link
 	if validationErr, exists := s.validated.Load(link.DownloadLink); exists {
 		if validationErr == nil {
+			// Re-fetch if the cached CDN URL has passed its declared expiry.
+			// Without this check a 3-hour TorBox CDN URL would be served from
+			// s.validated forever — bypassing the HEAD validation that would
+			// otherwise catch the expired URL.
+			if !link.ExpiresAt.IsZero() && time.Now().After(link.ExpiresAt) {
+				return s.invalidateAndRefetch(ctx, entry, link, attempt)
+			}
 			return link, nil // Already validated successfully
 		}
 		// Previous validation failed - check if we should retry
@@ -141,6 +175,10 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 
 	// Validate the link
 	validationErr := s.validateLink(ctx, &link)
+	// Backpressure is transient provider state, never a cached link failure.
+	if e := request.BackpressureError(validationErr); e != nil {
+		return emptyDownloadLink, e
+	}
 
 	if validationErr != nil {
 		// Handle link error categories
@@ -158,9 +196,18 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 					// Account swap doesn't consume a re-insertion attempt.
 					return s.fetchAndValidate(ctx, entry, filename, attempt)
 				}
-			} else if linkErr.ShouldRefetch() || linkErr.ShouldRetry() {
-				// Invalidate and refetch
+			} else if linkErr.ShouldRefetch() {
+				// The link itself is stale or rejected; a fresh one is needed.
 				return s.invalidateAndRefetch(ctx, entry, link, attempt)
+			} else if linkErr.ShouldRetry() {
+				// Transient provider/CDN state (5xx, wire blip, unknown code):
+				// the link itself is not known to be bad, so do not delete it
+				// or spend another requestdl on a refetch — invalidating the
+				// cached link per attempt is upstream #381's poll-driven API
+				// flood. Return the error without memoising it: the next
+				// GetLink revalidates the same link, so a wobble that has
+				// cleared recovers on the next attempt.
+				return emptyDownloadLink, validationErr
 			}
 		}
 	}
@@ -273,8 +320,16 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 		Deleted:   file.Deleted,
 	}
 
-	// This uses account-level caching internally
-	downloadLink, err := client.GetDownloadLink(ctx, placement.ID, debridFile)
+	// TorBox resolves its requestdl placeholder with the caller's playback
+	// context. Its plain GetDownloadLink remains free of network calls for repair.
+	var downloadLink types.DownloadLink
+	if playback, ok := client.(interface {
+		GetDownloadLinkForPlayback(context.Context, string, *types.File) (types.DownloadLink, error)
+	}); ok {
+		downloadLink, err = playback.GetDownloadLinkForPlayback(request.WithClass(ctx, request.ClassPlayback), placement.ID, debridFile)
+	} else {
+		downloadLink, err = client.GetDownloadLink(ctx, placement.ID, debridFile)
+	}
 	if err != nil {
 		return downloadLink, err
 	}
@@ -385,16 +440,40 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 		)
 	}
 
-	resp, err := s.httpClient.Do(req)
+	var resp *http.Response
+	if provider, ok := s.clients.Load(link.Debrid); ok {
+		if p, ok := provider.(request.ThrottleProvider); ok && p.RequestThrottle() != nil {
+			resp, err = p.RequestThrottle().Do(s.httpClient, req)
+		} else {
+			resp, err = s.httpClient.Do(req)
+		}
+	} else {
+		resp, err = s.httpClient.Do(req)
+	}
 	if err != nil {
+		if e := request.BackpressureError(err); e != nil {
+			return e
+		}
+		// Strip the URL credentials (the requestdl token query parameter)
+		// before the error is logged anywhere.
 		return NewRetryableError(
-			fmt.Errorf("HEAD request failed: %w", err),
+			fmt.Errorf("HEAD request failed: %w", request.RedactURLError(err)),
 			"network_error",
 		)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
+		// A cached link can point at a CDN host that is cooling down after
+		// serving a degraded stream; treat it as refetchable so a fresh
+		// link — preferably on another host — is dealt instead of
+		// re-serving the slow node.
+		if s.hostCooling(finalHost(resp)) {
+			return NewRefetchableError(
+				fmt.Errorf("CDN host %s in slow-stream cooldown", finalHost(resp)),
+				"host_cooldown",
+			)
+		}
 		return nil
 	}
 
@@ -404,6 +483,70 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 	}
 
 	return ErrorCodeToLinkError(errorCode)
+}
+
+// Resolve follows a download link's requestdl redirect through the provider's
+// shared throttle and returns the final CDN URL. Callers that hand a link to an
+// out-of-process consumer (for example the /api/browse download redirect) use
+// it so the requestdl call is charged to the shared budget instead of leaking
+// past Decypharr. It is deliberately provider-agnostic (not TorBox-only):
+// validateLink already HEADs the same URL for every provider, so this adds one
+// hop only on the /api/browse download route, after validation has succeeded.
+func (s *Service) Resolve(ctx context.Context, link types.DownloadLink) (string, error) {
+	if link.Empty() {
+		return "", NewPermanentError(ErrEmptyLink, "empty_link")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, link.DownloadLink, nil)
+	if err != nil {
+		return "", NewPermanentError(
+			fmt.Errorf("failed to create resolve request: %w", err),
+			"request_creation_failed",
+		)
+	}
+	client := s.httpClient
+	if provider, ok := s.clients.Load(link.Debrid); ok {
+		if p, ok := provider.(request.ThrottleProvider); ok && p.RequestThrottle() != nil {
+			resp, err := p.RequestThrottle().Do(client, req)
+			return s.finalURL(resp, err)
+		}
+	}
+	resp, err := client.Do(req)
+	return s.finalURL(resp, err)
+}
+
+// finalURL closes the probe response and returns the last URL in the redirect
+// chain. Backpressure passes through as a typed error.
+func (s *Service) finalURL(resp *http.Response, err error) (string, error) {
+	if err != nil {
+		if e := request.BackpressureError(err); e != nil {
+			return "", e
+		}
+		// Strip the requestdl token query parameter before this can be logged.
+		return "", NewRetryableError(
+			fmt.Errorf("resolve request failed: %w", request.RedactURLError(err)),
+			"network_error",
+		)
+	}
+	if resp == nil {
+		return "", NewRetryableError(fmt.Errorf("resolve returned no response"), "network_error")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Require a followed 2xx: an un-followed 3xx would otherwise hand back
+		// the token-bearing requestdl URL as the "resolved" target.
+		errorCode := resp.Header.Get("X-Error")
+		if errorCode == "" {
+			errorCode = strconv.Itoa(resp.StatusCode)
+		}
+		return "", ErrorCodeToLinkError(errorCode)
+	}
+	if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.String() != "" {
+		return resp.Request.URL.String(), nil
+	}
+	if location := resp.Header.Get("Location"); location != "" {
+		return location, nil
+	}
+	return "", NewRetryableError(fmt.Errorf("resolve returned no download URL"), "network_error")
 }
 
 // disableLinkAccount handles errors that require disabling an account
@@ -453,10 +596,104 @@ func (s *Service) invalidateAndRefetch(ctx context.Context, entry *storage.Entry
 
 	_ = client.DeleteLink(link) // This might fail, doesnt matter
 
-	return s.fetchLink(ctx, entry, link.Filename, attempt)
+	fresh, err := s.fetchLink(ctx, entry, link.Filename, attempt)
+	if err != nil {
+		return fresh, err
+	}
+	// A freshly dealt link can still land on a cooling CDN host; discard a
+	// bounded number of them before falling back to the last one dealt.
+	// CDNHost reads the link URL, not the final post-redirect URL: correct
+	// for pre-resolved providers (TorBox), documented no-op otherwise —
+	// see CDNHost.
+	for skipped := 0; skipped < maxCooldownSkips && s.hostCooling(CDNHost(fresh)); skipped++ {
+		s.logger.Info().
+			Str("host", CDNHost(fresh)).
+			Int("skipped", skipped+1).
+			Msg("Fresh link points at a cooling CDN host; refetching")
+		_ = client.DeleteLink(fresh)
+		if fresh, err = s.fetchLink(ctx, entry, link.Filename, attempt); err != nil {
+			return fresh, err
+		}
+	}
+	return fresh, nil
 }
 
 // Clear removes all validation tracking entries
 func (s *Service) Clear() {
 	s.validated.Clear()
+}
+
+// NoteSlowHost records that host served a degraded stream and deprioritizes
+// it for slowHostCooldown when fresh links are dealt. Called from the stream
+// recovery path after the slow-stream watchdog trips.
+func (s *Service) NoteSlowHost(host string, bps float64) {
+	if host == "" {
+		return
+	}
+	if s.cooldowns.Size() >= maxCooldownHosts {
+		s.sweepCooldowns()
+		if s.cooldowns.Size() >= maxCooldownHosts {
+			return // fail soft: drop the entry rather than grow unbounded
+		}
+	}
+	s.cooldowns.Store(host, time.Now().Add(slowHostCooldown))
+	s.logger.Warn().
+		Str("host", host).
+		Float64("kbps", bps/1024).
+		Dur("cooldown", slowHostCooldown).
+		Msg("CDN host served a degraded stream; cooling down")
+}
+
+// sweepCooldowns drops expired entries from the slow-host map.
+func (s *Service) sweepCooldowns() {
+	now := time.Now()
+	s.cooldowns.Range(func(host string, exp time.Time) bool {
+		if now.After(exp) {
+			s.cooldowns.Delete(host)
+		}
+		return true
+	})
+}
+
+// hostCooling reports whether host is inside its slow-stream cooldown.
+// Expired entries are reaped lazily on read.
+func (s *Service) hostCooling(host string) bool {
+	if host == "" {
+		return false
+	}
+	exp, ok := s.cooldowns.Load(host)
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		s.cooldowns.Delete(host)
+		return false
+	}
+	return true
+}
+
+// CDNHost extracts the host serving the bytes for a download link.
+//
+// ASSUMPTION: for providers whose playback links are pre-resolved CDN URLs
+// (TorBox: GetDownloadLinkForPlayback resolves requestdl before caching) this
+// is the CDN node itself, and it agrees with the final-URL host the stream
+// watchdog and validateLink measure. For providers whose links are
+// redirectors, this is the redirector host: a cooldown recorded against the
+// final CDN host then never matches here, so the skip filter degrades to a
+// no-op rather than misfiring. If a redirector-style provider ever needs the
+// filter, resolve the link (Service.Resolve) before comparing.
+func CDNHost(dl types.DownloadLink) string {
+	u, err := url.Parse(dl.DownloadLink)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
+}
+
+// finalHost returns the host of the last URL in a response's redirect chain.
+func finalHost(resp *http.Response) string {
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL.Host
+	}
+	return ""
 }

@@ -88,9 +88,10 @@ func (m *Manager) Stop() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	m.ready.Store(false)
 	// Unmount using backend, this also ensures the VFS manager is properly closed
 	if err := m.backend.Unmount(ctx); err != nil {
-		m.logger.Warn().Err(err).Msg("Backend unmount error")
+		return fmt.Errorf("backend unmount failed: %w", err)
 	}
 	m.ready.Store(false)
 	return nil

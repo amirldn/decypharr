@@ -16,37 +16,68 @@ import (
 )
 
 func ParseRateLimit(rateStr string) ratelimit.Limiter {
-	if rateStr == "" {
-		return nil
-	}
-	parts := strings.SplitN(rateStr, "/", 2)
-	if len(parts) != 2 {
-		return nil
-	}
-
-	// parse count
-	count, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-	if err != nil || count <= 0 {
+	count, period, ok := splitRate(rateStr)
+	if !ok {
 		return nil
 	}
 
 	// Set slack size to 10%
 	slackSize := count / 10
 
-	// normalize unit
+	switch period {
+	case time.Minute:
+		return ratelimit.New(count, ratelimit.Per(time.Minute), ratelimit.WithSlack(slackSize))
+	case time.Second:
+		return ratelimit.New(count, ratelimit.Per(time.Second), ratelimit.WithSlack(slackSize))
+	case time.Hour:
+		return ratelimit.New(count, ratelimit.Per(time.Hour), ratelimit.WithSlack(slackSize))
+	case 24 * time.Hour:
+		return ratelimit.New(count, ratelimit.Per(24*time.Hour), ratelimit.WithSlack(slackSize))
+	default:
+		return nil
+	}
+}
+
+// ParseRateValue parses the same "<count>/<unit>" syntax as ParseRateLimit
+// (for example "12/minute" or "10/second") into a per-minute rate. It is used
+// for limits that are enforced by a custom bucket rather than ratelimit.
+func ParseRateValue(rateStr string) (float64, bool) {
+	count, period, ok := splitRate(rateStr)
+	if !ok {
+		return 0, false
+	}
+	return float64(count) * float64(time.Minute) / float64(period), true
+}
+
+// splitRate parses the shared "<count>/<unit>" rate syntax. The unit accepts
+// the singular and plural spellings of second, minute, hour, and day.
+func splitRate(rateStr string) (int, time.Duration, bool) {
+	if rateStr == "" {
+		return 0, 0, false
+	}
+	parts := strings.SplitN(rateStr, "/", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+
+	count, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || count <= 0 {
+		return 0, 0, false
+	}
+
 	unit := strings.ToLower(strings.TrimSpace(parts[1]))
 	unit = strings.TrimSuffix(unit, "s")
 	switch unit {
 	case "minute", "min":
-		return ratelimit.New(count, ratelimit.Per(time.Minute), ratelimit.WithSlack(slackSize))
+		return count, time.Minute, true
 	case "second", "sec":
-		return ratelimit.New(count, ratelimit.Per(time.Second), ratelimit.WithSlack(slackSize))
+		return count, time.Second, true
 	case "hour", "hr":
-		return ratelimit.New(count, ratelimit.Per(time.Hour), ratelimit.WithSlack(slackSize))
+		return count, time.Hour, true
 	case "day", "d":
-		return ratelimit.New(count, ratelimit.Per(24*time.Hour), ratelimit.WithSlack(slackSize))
+		return count, 24 * time.Hour, true
 	default:
-		return nil
+		return 0, 0, false
 	}
 }
 

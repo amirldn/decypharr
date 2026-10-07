@@ -2,20 +2,27 @@ package manager
 
 import (
 	"context"
-	"github.com/sirrobot01/decypharr/internal/config"
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sourcegraph/conc/pool"
 )
 
 const (
-	MaxCacheWarmWorkers = 10
 	MaxNZBPreCacheFiles = 5
 	CacheWarmTimeout    = 60 * time.Second
+
+	// cacheWarmSerialFileCount is the media-file count at which a finished pack
+	// warms one file at a time. A 4+ episode pack used to fill the old 10-wide
+	// pool on its own; serializing it keeps the burst under the TorBox 429s
+	// from KGBos/liteflix#249 while a single episode or 2–3 file pack can still
+	// use DefaultCacheWarmWorkers.
+	cacheWarmSerialFileCount = 4
 
 	// Container metadata lives at the head (streamable MP4 moov, EBML header)
 	// or the tail (non-streamable MP4 moov, MKV cues/seek index), so warming
@@ -53,27 +60,114 @@ func (m *Manager) RefreshMount() error {
 	return nil
 }
 
+// cacheWarmMaxWorkers returns the process-wide cache-warm slot cap from
+// config, falling back to DefaultCacheWarmWorkers when unset.
+func (m *Manager) cacheWarmMaxWorkers() int {
+	if m != nil && m.config != nil && config.Get().MaxCacheWarmWorkers > 0 {
+		return config.Get().MaxCacheWarmWorkers
+	}
+	return config.DefaultCacheWarmWorkers
+}
+
+// cacheWarmConcurrency is the per-call worker-pool size. Short packs (under
+// cacheWarmSerialFileCount media files) may run up to `configured` workers so
+// a single episode stays fast; larger packs serialize.
+func cacheWarmConcurrency(nMediaFiles, configured int) int {
+	max := configured
+	if max <= 0 {
+		max = config.DefaultCacheWarmWorkers
+	}
+	if nMediaFiles <= 0 {
+		return 1
+	}
+	if nMediaFiles >= cacheWarmSerialFileCount {
+		return 1
+	}
+	return min(nMediaFiles, max)
+}
+
+// cacheWarmGate is a counting semaphore whose max is supplied at acquire
+// time, so a live config change takes effect on the next slot.
+type cacheWarmGate struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	inUse int
+}
+
+func newCacheWarmGate() *cacheWarmGate {
+	g := &cacheWarmGate{}
+	g.cond = sync.NewCond(&g.mu)
+	return g
+}
+
+func (g *cacheWarmGate) acquire(max int) {
+	if max < 1 {
+		max = 1
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for g.inUse >= max {
+		g.cond.Wait()
+	}
+	g.inUse++
+}
+
+func (g *cacheWarmGate) release() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.inUse > 0 {
+		g.inUse--
+	}
+	g.cond.Signal()
+}
+
+func (m *Manager) getCacheWarmGate() *cacheWarmGate {
+	m.cacheWarmOnce.Do(func() {
+		m.cacheWarmGate = newCacheWarmGate()
+	})
+	return m.cacheWarmGate
+}
+
 // WarmFileCache reads the head and tail of each media file through the mount
 // to warm the VFS disk cache, so a subsequent media probe or import scan over
 // the mount is fast. This replaces spawning ffprobe: the read pattern is
 // deterministic, needs no external binary, and warms the exact bytes a
 // downstream probe seeks to (see cacheWarmHeadSize/cacheWarmTailSize).
+//
+// Concurrency is capped two ways so a finished season pack cannot open 10
+// TorBox reads at once (liteflix#249): a per-call pool (serial for 4+ media
+// files) and a Manager-wide gate so overlapping packs share the same budget.
 func (m *Manager) WarmFileCache(filePaths []string) error {
 	if len(filePaths) == 0 {
 		return nil
 	}
 
-	// Use a worker pool to limit concurrency and avoid overwhelming the system
-	p := pool.New().WithMaxGoroutines(min(len(filePaths), MaxCacheWarmWorkers))
-
+	media := make([]string, 0, len(filePaths))
 	for _, fp := range filePaths {
-		if !utils.IsMediaFile(fp) {
-			continue
+		if utils.IsMediaFile(fp) {
+			media = append(media, fp)
 		}
+	}
+	if len(media) == 0 {
+		return nil
+	}
+
+	max := m.cacheWarmMaxWorkers()
+	workers := cacheWarmConcurrency(len(media), max)
+	p := pool.New().WithMaxGoroutines(workers)
+	gate := m.getCacheWarmGate()
+
+	for _, fp := range media {
 		p.Go(func() {
+			gate.acquire(max)
+			defer gate.release()
 			ctx, cancel := context.WithTimeout(context.Background(), CacheWarmTimeout)
 			defer cancel()
-			if err := m.warmOneFile(ctx, fp); err != nil {
+			warm := m.warmOneFile
+			if m.warmOneFileFn != nil {
+				warm = m.warmOneFileFn
+			}
+			if err := warm(ctx, fp); err != nil {
 				// Log error but continue
 				m.logger.Warn().
 					Err(err).
