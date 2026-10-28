@@ -39,9 +39,11 @@
 > **Branches:**
 > - `main` / `feat/edge-cache`: the deployed build.
 > - `integrate/kgbos-v2.6`: v2.6 + KGBos + local fixes, without the edge cache.
-> - `archive/main-2026-10-11`: the previous `main` (pre-v2.6 custom build on upstream `main`). It holds two
->   fixes from 2026-10-08 that are **not** in this build yet: Arr authentication and recovery submissions
->   (`66c2cb5`), and Radarr manual-import payloads (`26f9f51`).
+> - `archive/main-2026-10-11`: the previous `main` (pre-v2.6 custom build on upstream `main`). It also
+>   carries two post-v2.6 **upstream** fixes, `66c2cb5` (Arr authentication and recovery submissions) and
+>   `26f9f51` (Radarr manual-import payloads). They were left out on purpose: this build already has its own
+>   category-less Arr login, and neither bug appeared in the deployed logs. They will come back with the next
+>   upstream rebase.
 >
 > **Building:** `docker build --build-arg VERSION=2.6-custom-edge-<sha> --build-arg CHANNEL=stable -t amirldn/decypharr:2.6-custom-edge-<sha> .`
 > Images are built and deployed locally. They are not published to a registry.
