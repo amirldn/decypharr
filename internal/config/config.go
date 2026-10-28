@@ -313,6 +313,8 @@ type Config struct {
 
 	Hearsay Hearsay `json:"hearsay,omitzero"`
 
+	EdgeCache EdgeCache `json:"edge_cache,omitzero"`
+
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
 	QueueCleanup QueueCleanup `json:"queue_cleanup"`
 }

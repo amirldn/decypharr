@@ -23,6 +23,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/arr/reacquire"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"github.com/sirrobot01/decypharr/pkg/edgecache"
 	"github.com/sirrobot01/decypharr/pkg/hearsay"
 	"github.com/sirrobot01/decypharr/pkg/manager/link"
 	"github.com/sirrobot01/decypharr/pkg/manager/virtualfolders"
@@ -129,6 +130,9 @@ type Manager struct {
 
 	// Hearsay network participation; nil when disabled.
 	hearsay *hearsay.Service
+
+	// Persistent head/tail store; nil when disabled.
+	edgeCache *edgecache.Service
 }
 
 var _ repair.Backend = (*Manager)(nil)
@@ -291,6 +295,8 @@ func (m *Manager) init() {
 	} else {
 		m.hearsay = hs
 	}
+
+	m.initEdgeCache()
 
 	m.repair = repair.New(repair.Dependencies{
 		Scheduler:     m.scheduler,
@@ -504,6 +510,8 @@ func (m *Manager) Start(ctx context.Context) error {
 	if err := m.StartWorker(ctx); err != nil {
 		return fmt.Errorf("failed to start manager worker: %w", err)
 	}
+
+	m.edgeCache.Start(ctx)
 
 	// Start network participation when the operator opted in.
 	if m.hearsay != nil {

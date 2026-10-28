@@ -11,6 +11,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/utils"
+	"github.com/sirrobot01/decypharr/pkg/edgecache"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
@@ -52,16 +53,43 @@ func (h *Handler) StreamResponse(entry *storage.Entry, name string, size int64, 
 		strings.HasPrefix(strings.ToLower(client), "rclone/") {
 		owner = manager.RewindOwnerDownstream
 	}
-	stream, err := h.manager.OpenStreamWithRewindOwner(r.Context(), entry, name, start, client, owner)
-	if err != nil {
-		return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, false)
+	// The edge cache serves stored head/tail bytes locally; only the rest of
+	// the range (at most one contiguous run) goes to the debrid stream.
+	edge := h.manager.EdgeCache()
+	store := edge.Store()
+	segs := []edgecache.Segment{{Start: start, End: end}}
+	var key string
+	var headHave, tailHave int64
+	if store != nil {
+		key = edgecache.Key(entry.InfoHash, name, size)
+		headHave, tailHave = store.Coverage(key, size)
+		segs = edgecache.Plan(start, end, size, headHave, tailHave)
 	}
-	defer stream.Close()
+	var remoteStart int64 = -1
+	for _, seg := range segs {
+		if !seg.Local {
+			remoteStart = seg.Start
+		}
+	}
 
-	// Fast-fail before headers: an unreachable link becomes a proper error
-	// status instead of a dead 200.
-	if err := stream.Prime(); err != nil {
-		return customerror.FromError(err)
+	var stream manager.StreamReader
+	if remoteStart >= 0 {
+		var err error
+		stream, err = h.manager.OpenStreamWithRewindOwner(r.Context(), entry, name, remoteStart, client, owner)
+		if err != nil {
+			return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, false)
+		}
+		defer stream.Close()
+
+		// Fast-fail before headers: an unreachable link becomes a proper error
+		// status instead of a dead 200. When the response starts with stored
+		// bytes, skip the wait so the client gets them immediately; the debrid
+		// connection opens while they are sent.
+		if !segs[0].Local {
+			if err := stream.Prime(); err != nil {
+				return customerror.FromError(err)
+			}
+		}
 	}
 
 	length := end - start + 1
@@ -75,13 +103,27 @@ func (h *Handler) StreamResponse(entry *storage.Entry, name string, size int64, 
 	}
 	w.WriteHeader(statusCode)
 
-	// The wrapper struct hides w's ReaderFrom so io.CopyBuffer uses the
-	// pooled buffer instead of net/http's 32KB one.
-	bufPtr := streamCopyBufPool.Get().(*[]byte)
-	_, err = io.CopyBuffer(struct{ io.Writer }{w}, io.LimitReader(stream, length), *bufPtr)
-	streamCopyBufPool.Put(bufPtr)
-	if err != nil {
-		return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, true)
+	for _, seg := range segs {
+		if seg.Local {
+			if err := store.CopySegment(w, key, size, seg); err != nil {
+				return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, true)
+			}
+			continue
+		}
+		// The wrapper struct hides w's ReaderFrom so io.CopyBuffer uses the
+		// pooled buffer instead of net/http's 32KB one.
+		var dst io.Writer = struct{ io.Writer }{w}
+		capture := newEdgeCapture(dst, store, seg, size, headHave, tailHave)
+		if capture != nil {
+			dst = capture
+		}
+		bufPtr := streamCopyBufPool.Get().(*[]byte)
+		_, err := io.CopyBuffer(dst, io.LimitReader(stream, seg.End-seg.Start+1), *bufPtr)
+		streamCopyBufPool.Put(bufPtr)
+		if err != nil {
+			return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, true)
+		}
+		capture.finish(edge, entry.InfoHash, name, size)
 	}
 	return nil
 }
