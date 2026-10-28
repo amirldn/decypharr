@@ -813,7 +813,7 @@ func (m *Manager) OpenStreamForFile(ctx context.Context, info *FileInfo, offset 
 }
 
 func (m *Manager) openSession(ctx context.Context, entry *storage.Entry, filename string, offset int64, owner RewindOwner) (*session, string, string, error) {
-	ctx = request.WithClass(ctx, request.ClassPlayback)
+	ctx = request.PlaybackUnlessSet(ctx)
 	file, ok := entry.Files[filename]
 	if !ok {
 		return nil, "", "", fmt.Errorf("file %s not found in entry %s", filename, entry.Name)
