@@ -205,6 +205,10 @@ func (d *Downloader) processSymlink(entry *storage.Entry, mountPath string) erro
 		return err
 	}
 
+	// Keep the head and tail of every media file on local disk so future
+	// plays start without a cold debrid fetch. Queued, never blocks import.
+	d.manager.edgeCache.EnqueueImport(entry)
+
 	// Warm the mount cache for the first few files so a subsequent import scan is fast
 	// Usenet parsing/probing deliberately avoids the streaming read-ahead
 	// setting. A large playback window can turn a small import probe into a

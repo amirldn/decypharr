@@ -82,6 +82,26 @@ func WithClass(ctx context.Context, class Class) context.Context {
 	return context.WithValue(ctx, classContextKey{}, class.normalized())
 }
 
+// HasClass reports whether ctx carries an explicit priority lane. Stream
+// openers default to playback only when the caller did not choose a lane, so
+// background fillers can opt out of the playback lane.
+func HasClass(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	_, ok := ctx.Value(classContextKey{}).(Class)
+	return ok
+}
+
+// PlaybackUnlessSet tags ctx with the playback lane unless the caller already
+// chose one.
+func PlaybackUnlessSet(ctx context.Context) context.Context {
+	if HasClass(ctx) {
+		return ctx
+	}
+	return WithClass(ctx, ClassPlayback)
+}
+
 // ClassOf returns the priority lane tagged on ctx, defaulting to background.
 func ClassOf(ctx context.Context) Class {
 	if ctx != nil {
