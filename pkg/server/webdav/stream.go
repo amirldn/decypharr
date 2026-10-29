@@ -41,11 +41,15 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	entry, err := h.manager.GetEntry(infohash)
 	if err != nil {
+		h.logger.Rate("404/"+infohash).Warn().Err(err).Str("infohash", infohash).
+			Msg("WebDAV 404: stream entry not found")
 		http.Error(w, "Not Found", http.StatusNotFound)
 		return
 	}
 	file, err := entry.GetFileByID(fileID)
 	if err != nil {
+		h.logger.Rate("404/"+infohash+"/"+fileID).Warn().Err(err).Str("infohash", infohash).Str("file_id", fileID).
+			Msg("WebDAV 404: stream file not found")
 		http.Error(w, "Not Found", http.StatusNotFound)
 		return
 	}

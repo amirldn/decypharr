@@ -64,6 +64,7 @@ func (m *Manager) refreshTorrents(ctx context.Context, provider string, debridCl
 
 // doRefreshTorrents performs the actual refresh logic
 func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridClient debrid.Client) error {
+	started := time.Now()
 	remote, err := debridClient.GetTorrents()
 	if err != nil {
 		m.logger.Error().Err(err).Str("debrid", provider).Msg("Failed to get remote")
@@ -93,6 +94,13 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 		return err
 	}
 
+	// Diagnostic: 404 bursts on fresh pack files start within seconds of a
+	// refresh (6 of 8 since 2026-10-18), so record what each one changes.
+	m.logger.Debug().Str("debrid", provider).Int("remote", len(remote)).
+		Int("new_or_changed", len(newTorrents)).Int("updated", len(torrentsToUpdate)).
+		Int("deleted", len(torrentsToDelete)).Dur("list_took", time.Since(started)).
+		Msg("Torrent refresh: changes detected")
+
 	// Handle deletions
 	m.handleTorrentDeletions(torrentsToDelete)
 
@@ -118,6 +126,7 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 	// Wait for concurrent update to finish
 	updateWg.Wait()
 
+	m.logger.Debug().Str("debrid", provider).Dur("took", time.Since(started)).Msg("Torrent refresh: storage writes done")
 	return nil
 }
 
@@ -190,6 +199,7 @@ func (m *Manager) handleTorrentDeletions(torrentsToDelete []string) {
 	for range deleteWorkers {
 		deleteWg.Go(func() {
 			for infohash := range deleteChan {
+				m.logger.Info().Str("infohash", infohash).Msg("Torrent refresh: deleting entry missing from provider list")
 				if err := m.storage.Delete(infohash); err != nil {
 					m.logger.Error().Err(err).Str("infohash", infohash).Msg("Failed to delete torrent")
 				}
