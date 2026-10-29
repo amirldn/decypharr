@@ -2,6 +2,7 @@ package qbit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -24,7 +25,9 @@ func (q *QBit) addMagnet(ctx context.Context, url string, arr arr.Arr, debrid st
 
 	importReq := manager.NewTorrentRequest(debrid, q.downloadFolder, magnet, arr, action, arr.DownloadUncached, callbackURL, manager.ImportTypeQBit, skipMultiSeason)
 
-	err = q.manager.AddNewTorrent(ctx, importReq)
+	err = boundedAdd(ctx, torrentAddTimeout, func(ctx context.Context) error {
+		return q.manager.AddNewTorrent(ctx, importReq)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to process torrent: %w", err)
 	}
@@ -42,7 +45,9 @@ func (q *QBit) addTorrent(ctx context.Context, fileHeader *multipart.FileHeader,
 		return customerror.NewError(fmt.Errorf("error reading file %s: %w", fileHeader.Filename, err), http.StatusBadRequest, "invalid_torrent", false, false).Permanent()
 	}
 	importReq := manager.NewTorrentRequest(debrid, q.downloadFolder, magnet, arr, action, arr.DownloadUncached, callbackURL, manager.ImportTypeQBit, skipMultiSeason)
-	err = q.manager.AddNewTorrent(ctx, importReq)
+	err = boundedAdd(ctx, torrentAddTimeout, func(ctx context.Context) error {
+		return q.manager.AddNewTorrent(ctx, importReq)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to process torrent: %w", err)
 	}
@@ -117,4 +122,26 @@ func (q *QBit) addTags(tags []string) bool {
 		}
 	}
 	return true
+}
+
+// torrentAddTimeout bounds how long an Arr's add request waits on the debrid
+// provider. Healthy TorBox adds take about 1s (p99 7s over 874 adds), but a
+// degraded cache check used to hold the request until the Arr's own 100s
+// HTTP timeout, once per release it tried. Failing at 30s lets the Arr move
+// on to the next release, or give up and leave the item for a later search.
+const torrentAddTimeout = 30 * time.Second
+
+// boundedAdd runs add under a deadline. If the deadline expires, the result
+// is a retryable 504 so the Arr treats it as a provider problem.
+func boundedAdd(ctx context.Context, timeout time.Duration, add func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := add(ctx)
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return customerror.NewError(
+			fmt.Errorf("debrid provider did not answer within %s: %w", timeout, err),
+			http.StatusGatewayTimeout, "provider_timeout", false, false,
+		).Retryable()
+	}
+	return err
 }
