@@ -131,6 +131,11 @@ func (h *Handler) handleTorrentFile(w http.ResponseWriter, r *http.Request) {
 	file := utils.PathUnescape(chi.URLParam(r, "file"))
 	currentInfo, err := h.manager.GetTorrentFile(torrent, file)
 	if err != nil || currentInfo == nil {
+		// Diagnostic: fresh season-pack files have briefly returned 404 right
+		// after a torrent refresh (2026-10-29); record which lookup failed.
+		h.logger.Rate("404/"+torrent+"/"+file).Warn().Err(err).
+			Str("entry", torrent).Str("file", file).Str("method", r.Method).
+			Msg("WebDAV 404: file lookup by name failed")
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
