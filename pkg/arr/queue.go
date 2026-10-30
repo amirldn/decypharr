@@ -125,7 +125,13 @@ func (s *Service) CleanupQueue(ctx context.Context, name string) error {
 	rules := config.Get().QueueCleanup.Rules
 	now := s.clock()
 	pending := make(map[string]struct{})
-	var blocklist, blocklistResearch []int
+	// Removals are grouped by action and by whether the download stays in the
+	// client: a partly imported pack keeps its files, because the episodes
+	// already imported link to them.
+	type removal struct {
+		skipRedownload, removeFromClient bool
+	}
+	removals := make(map[removal][]int)
 	var manualImports []string
 	for _, item := range items {
 		action := resolveQueueAction(item, rules)
@@ -134,10 +140,12 @@ func (s *Service) CleanupQueue(ctx context.Context, name string) error {
 			continue
 		}
 		switch action {
-		case QueueActionBlocklist:
-			blocklist = append(blocklist, item.Id)
-		case QueueActionBlocklistResearch:
-			blocklistResearch = append(blocklistResearch, item.Id)
+		case QueueActionBlocklist, QueueActionBlocklistResearch:
+			key := removal{
+				skipRedownload:   action == QueueActionBlocklist,
+				removeFromClient: !catalogMatchers["episodes_missing"](item, queueStatusText(item)),
+			}
+			removals[key] = append(removals[key], item.Id)
 		case QueueActionImport:
 			// Sonarr lists a season pack once per episode, all sharing one downloadId.
 			if !slices.Contains(manualImports, item.DownloadId) {
@@ -147,14 +155,13 @@ func (s *Service) CleanupQueue(ctx context.Context, name string) error {
 	}
 	s.forgetClearedImportProblems(name, pending)
 
-	if len(blocklistResearch) > 0 {
-		if err := s.removeQueueItems(ctx, name, blocklistResearch, false); err != nil {
-			s.logger.Error().Err(err).Str("arr", name).Msg("Queue cleanup: blocklist and research failed")
-		}
-	}
-	if len(blocklist) > 0 {
-		if err := s.removeQueueItems(ctx, name, blocklist, true); err != nil {
-			s.logger.Error().Err(err).Str("arr", name).Msg("Queue cleanup: blocklist failed")
+	for key, ids := range removals {
+		if err := s.removeQueueItems(ctx, name, ids, key.skipRedownload, key.removeFromClient); err != nil {
+			msg := "Queue cleanup: blocklist and research failed"
+			if key.skipRedownload {
+				msg = "Queue cleanup: blocklist failed"
+			}
+			s.logger.Error().Err(err).Str("arr", name).Bool("remove_from_client", key.removeFromClient).Msg(msg)
 		}
 	}
 	for _, downloadID := range manualImports {
@@ -174,14 +181,7 @@ func resolveQueueAction(item QueueSchema, rules []config.QueueCleanupRule) Queue
 		return QueueActionNone
 	}
 
-	var builder strings.Builder
-	for _, message := range item.StatusMessages {
-		builder.WriteString(message.Title)
-		builder.WriteByte(' ')
-		builder.WriteString(strings.Join(message.Messages, " "))
-		builder.WriteByte(' ')
-	}
-	text := strings.ToLower(builder.String())
+	text := queueStatusText(item)
 
 	for _, rule := range rules {
 		matched := false
@@ -205,15 +205,29 @@ func resolveQueueAction(item QueueSchema, rules []config.QueueCleanupRule) Queue
 	return QueueActionNone
 }
 
+// queueStatusText is the lowercased join of a queue item's status message
+// titles and messages, which the cleanup rules match against.
+func queueStatusText(item QueueSchema) string {
+	var builder strings.Builder
+	for _, message := range item.StatusMessages {
+		builder.WriteString(message.Title)
+		builder.WriteByte(' ')
+		builder.WriteString(strings.Join(message.Messages, " "))
+		builder.WriteByte(' ')
+	}
+	return strings.ToLower(builder.String())
+}
+
 // removeQueueItems blocklists and removes queue items. skipRedownload keeps the
-// Arr from searching for a replacement.
-func (s *Service) removeQueueItems(ctx context.Context, name string, ids []int, skipRedownload bool) error {
+// Arr from searching for a replacement; removeFromClient also deletes the
+// download from decypharr.
+func (s *Service) removeQueueItems(ctx context.Context, name string, ids []int, skipRedownload, removeFromClient bool) error {
 	instance, err := s.instance(name)
 	if err != nil {
 		return err
 	}
 	query := url.Values{
-		"removeFromClient": {"true"},
+		"removeFromClient": {strconv.FormatBool(removeFromClient)},
 		"blocklist":        {"true"},
 		"skipRedownload":   {strconv.FormatBool(skipRedownload)},
 		"changeCategory":   {"false"},
