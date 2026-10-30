@@ -7,11 +7,16 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 )
 
 type QueueAction string
+
+// queueCleanupGrace is how long an import problem must persist before the
+// cleanup acts on it.
+const queueCleanupGrace = 15 * time.Minute
 
 const (
 	QueueActionNone              QueueAction = ""
@@ -117,27 +122,42 @@ func (s *Service) CleanupQueue(ctx context.Context, name string) error {
 	}
 
 	rules := config.Get().QueueCleanup.Rules
-	var blocklist, blocklistResearch []int
+	now := s.clock()
+	pending := make(map[string]struct{})
+	// Removals are grouped by action and by whether the download stays in the
+	// client: a partly imported pack keeps its files, because the episodes
+	// already imported link to them.
+	type removal struct {
+		skipRedownload, removeFromClient bool
+	}
+	removals := make(map[removal][]int)
 	var manualImports []string
 	for _, item := range items {
-		switch resolveQueueAction(item, rules) {
-		case QueueActionBlocklist:
-			blocklist = append(blocklist, item.Id)
-		case QueueActionBlocklistResearch:
-			blocklistResearch = append(blocklistResearch, item.Id)
+		action := resolveQueueAction(item, rules)
+		if (action == QueueActionBlocklist || action == QueueActionBlocklistResearch) &&
+			!s.importProblemPersisted(name, item, now, pending) {
+			continue
+		}
+		switch action {
+		case QueueActionBlocklist, QueueActionBlocklistResearch:
+			key := removal{
+				skipRedownload:   action == QueueActionBlocklist,
+				removeFromClient: !catalogMatchers["episodes_missing"](item, queueStatusText(item)),
+			}
+			removals[key] = append(removals[key], item.Id)
 		case QueueActionImport:
 			manualImports = append(manualImports, item.DownloadId)
 		}
 	}
+	s.forgetClearedImportProblems(name, pending)
 
-	if len(blocklistResearch) > 0 {
-		if err := s.removeQueueItems(ctx, name, blocklistResearch, false); err != nil {
-			s.logger.Error().Err(err).Str("arr", name).Msg("Queue cleanup: blocklist and research failed")
-		}
-	}
-	if len(blocklist) > 0 {
-		if err := s.removeQueueItems(ctx, name, blocklist, true); err != nil {
-			s.logger.Error().Err(err).Str("arr", name).Msg("Queue cleanup: blocklist failed")
+	for key, ids := range removals {
+		if err := s.removeQueueItems(ctx, name, ids, key.skipRedownload, key.removeFromClient); err != nil {
+			msg := "Queue cleanup: blocklist and research failed"
+			if key.skipRedownload {
+				msg = "Queue cleanup: blocklist failed"
+			}
+			s.logger.Error().Err(err).Str("arr", name).Bool("remove_from_client", key.removeFromClient).Msg(msg)
 		}
 	}
 	for _, downloadID := range manualImports {
@@ -157,14 +177,7 @@ func resolveQueueAction(item QueueSchema, rules []config.QueueCleanupRule) Queue
 		return QueueActionNone
 	}
 
-	var builder strings.Builder
-	for _, message := range item.StatusMessages {
-		builder.WriteString(message.Title)
-		builder.WriteByte(' ')
-		builder.WriteString(strings.Join(message.Messages, " "))
-		builder.WriteByte(' ')
-	}
-	text := strings.ToLower(builder.String())
+	text := queueStatusText(item)
 
 	for _, rule := range rules {
 		matched := false
@@ -188,15 +201,29 @@ func resolveQueueAction(item QueueSchema, rules []config.QueueCleanupRule) Queue
 	return QueueActionNone
 }
 
+// queueStatusText is the lowercased join of a queue item's status message
+// titles and messages, which the cleanup rules match against.
+func queueStatusText(item QueueSchema) string {
+	var builder strings.Builder
+	for _, message := range item.StatusMessages {
+		builder.WriteString(message.Title)
+		builder.WriteByte(' ')
+		builder.WriteString(strings.Join(message.Messages, " "))
+		builder.WriteByte(' ')
+	}
+	return strings.ToLower(builder.String())
+}
+
 // removeQueueItems blocklists and removes queue items. skipRedownload keeps the
-// Arr from searching for a replacement.
-func (s *Service) removeQueueItems(ctx context.Context, name string, ids []int, skipRedownload bool) error {
+// Arr from searching for a replacement; removeFromClient also deletes the
+// download from decypharr.
+func (s *Service) removeQueueItems(ctx context.Context, name string, ids []int, skipRedownload, removeFromClient bool) error {
 	instance, err := s.instance(name)
 	if err != nil {
 		return err
 	}
 	query := url.Values{
-		"removeFromClient": {"true"},
+		"removeFromClient": {strconv.FormatBool(removeFromClient)},
 		"blocklist":        {"true"},
 		"skipRedownload":   {strconv.FormatBool(skipRedownload)},
 		"changeCategory":   {"false"},
@@ -213,4 +240,59 @@ func (s *Service) removeQueueItems(ctx context.Context, name string, ids []int, 
 		return fmt.Errorf("remove queue items: %w", err)
 	}
 	return nil
+}
+
+// importProblemPersisted reports whether a queue item may be blocklisted now.
+// A download the client reports as failed is acted on at once. Anything else
+// (an import problem) must stay in a failing state for queueCleanupGrace:
+// Sonarr and Radarr retry imports about once a minute, so a short read
+// failure on the mount resolves itself, while a blocklist is permanent. Items
+// still inside the grace period are recorded in pending.
+func (s *Service) importProblemPersisted(name string, item QueueSchema, now time.Time, pending map[string]struct{}) bool {
+	if strings.EqualFold(item.Status, "failed") {
+		return true
+	}
+	key := item.DownloadId
+	if key == "" {
+		key = strconv.Itoa(item.Id)
+	}
+
+	s.cleanupMu.Lock()
+	defer s.cleanupMu.Unlock()
+	if s.cleanupSeen == nil {
+		s.cleanupSeen = make(map[string]map[string]time.Time)
+	}
+	seen := s.cleanupSeen[name]
+	if seen == nil {
+		seen = make(map[string]time.Time)
+		s.cleanupSeen[name] = seen
+	}
+	first, ok := seen[key]
+	if !ok {
+		first = now
+		seen[key] = now
+		s.logger.Debug().Str("arr", name).Str("download_id", key).Str("title", item.Title).
+			Dur("grace", queueCleanupGrace).Msg("Queue cleanup: import problem seen; waiting before acting")
+	}
+	pending[key] = struct{}{}
+	return now.Sub(first) >= queueCleanupGrace
+}
+
+// forgetClearedImportProblems drops grace timers for downloads that no longer
+// show an import problem, so a later, unrelated failure starts a fresh timer.
+func (s *Service) forgetClearedImportProblems(name string, pending map[string]struct{}) {
+	s.cleanupMu.Lock()
+	defer s.cleanupMu.Unlock()
+	for key := range s.cleanupSeen[name] {
+		if _, ok := pending[key]; !ok {
+			delete(s.cleanupSeen[name], key)
+		}
+	}
+}
+
+func (s *Service) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }

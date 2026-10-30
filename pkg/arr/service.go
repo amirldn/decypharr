@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -25,6 +26,13 @@ type Service struct {
 	mutation *request.Client
 	logger   zerolog.Logger
 	cleanups singleflight.Group
+
+	// cleanupSeen records, per instance and download ID, when an import
+	// problem was first seen, for the queue cleanup grace period.
+	cleanupMu   sync.Mutex
+	cleanupSeen map[string]map[string]time.Time
+
+	now func() time.Time // test hook; nil uses time.Now
 }
 
 func New() *Service {

@@ -95,6 +95,9 @@ func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, 
 		return
 	}
 	if entry == nil {
+		h.logger.Rate("404/"+info.Parent()+"/"+info.Name()).Warn().
+			Str("entry", info.Parent()).Str("file", info.Name()).
+			Msg("WebDAV 404: entry for file not found")
 		http.Error(w, "File Not Found", http.StatusNotFound)
 		return
 	}

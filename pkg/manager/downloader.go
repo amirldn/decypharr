@@ -29,6 +29,8 @@ import (
 type Downloader struct {
 	manager *Manager
 	logger  zerolog.Logger
+
+	completeFn func(*storage.Entry) // test hook; nil uses completeEntry
 }
 
 const (
@@ -209,26 +211,47 @@ func (d *Downloader) processSymlink(entry *storage.Entry, mountPath string) erro
 	// plays start without a cold debrid fetch. Queued, never blocks import.
 	d.manager.edgeCache.EnqueueImport(entry)
 
-	// Warm the mount cache for the first few files so a subsequent import scan is fast
+	d.completeAndWarm(entry, filePaths)
+
+	return nil
+}
+
+// completeAndWarm reports a finished entry complete, then warms the mount
+// cache for its first few files in the background. The warm used to run
+// first, so the Arr waited 5–11s per film (37–47s per pack) before it could
+// even start importing; now the Arr's next poll overlaps the warm, and any
+// bytes they both read are fetched once by the mount cache.
+func (d *Downloader) completeAndWarm(entry *storage.Entry, filePaths []string) {
+	d.complete(entry)
+
 	// Usenet parsing/probing deliberately avoids the streaming read-ahead
 	// setting. A large playback window can turn a small import probe into a
 	// substantial background download and hold an active slot unnecessarily.
-	if !entry.IsNZB() && !config.Get().SkipPreCache && len(filePaths) > 0 {
-		probeFiles := filePaths
-		if len(probeFiles) > MaxNZBPreCacheFiles {
-			probeFiles = probeFiles[:MaxNZBPreCacheFiles]
-		}
-		d.logger.Debug().Int("files", len(probeFiles)).Msgf("Warming cache for %s", entry.Name)
+	if entry.IsNZB() || config.Get().SkipPreCache || len(filePaths) == 0 {
+		return
+	}
+	probeFiles := filePaths
+	if len(probeFiles) > MaxNZBPreCacheFiles {
+		probeFiles = probeFiles[:MaxNZBPreCacheFiles]
+	}
+	name, total := entry.Name, len(filePaths)
+	go func() {
+		d.logger.Debug().Int("files", len(probeFiles)).Msgf("Warming cache for %s", name)
 		if err := d.manager.WarmFileCache(probeFiles); err != nil {
 			d.logger.Error().Msgf("Failed to warm cache: %s", err)
-		} else {
-			d.logger.Debug().Str("entry", entry.Name).Msgf("Warmed cache for %d/%d files", len(probeFiles), len(filePaths))
+			return
 		}
+		d.logger.Debug().Str("entry", name).Msgf("Warmed cache for %d/%d files", len(probeFiles), total)
+	}()
+}
+
+// complete reports entry as finished; completeFn replaces it in tests.
+func (d *Downloader) complete(entry *storage.Entry) {
+	if d.completeFn != nil {
+		d.completeFn(entry)
+		return
 	}
-
 	d.completeEntry(entry)
-
-	return nil
 }
 
 func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, files []*storage.File, mountPath string, symlinkDir string) ([]string, error) {
