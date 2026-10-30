@@ -16,6 +16,8 @@ type fakeQueueArr struct {
 	mu       sync.Mutex
 	records  []QueueSchema
 	removals [][]int
+	// fromClient records the removeFromClient flag of each bulk removal.
+	fromClient []string
 }
 
 func (f *fakeQueueArr) set(records ...QueueSchema) {
@@ -46,6 +48,7 @@ func (f *fakeQueueArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = stdjson.NewDecoder(r.Body).Decode(&payload)
 		f.removals = append(f.removals, payload.Ids)
+		f.fromClient = append(f.fromClient, r.URL.Query().Get("removeFromClient"))
 		w.WriteHeader(http.StatusOK)
 	default:
 		w.WriteHeader(http.StatusNotFound)
@@ -53,6 +56,10 @@ func (f *fakeQueueArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func importProblem(id int, downloadID string) QueueSchema {
+	return queueProblem(id, downloadID, "No files found are eligible for import in /mnt/symlinks/sonarr/pack")
+}
+
+func queueProblem(id int, downloadID, message string) QueueSchema {
 	item := QueueSchema{
 		Id:                    id,
 		DownloadId:            downloadID,
@@ -63,7 +70,7 @@ func importProblem(id int, downloadID string) QueueSchema {
 	item.StatusMessages = append(item.StatusMessages, struct {
 		Title    string   `json:"title"`
 		Messages []string `json:"messages"`
-	}{Title: "No files found are eligible for import in /mnt/symlinks/sonarr/pack"})
+	}{Title: message})
 	return item
 }
 
@@ -151,5 +158,48 @@ func TestCleanupQueueRestartsGraceWhenProblemClears(t *testing.T) {
 	}
 	if arr.removed() != 0 {
 		t.Fatal("grace timer carried over from an earlier, cleared problem")
+	}
+}
+
+// A pack covering only part of a season is reported as "episodes missing"
+// even after its files imported. Removing the download from decypharr then
+// deletes the files those imported episodes link to (2026-10-30, Naruto
+// S2 Part 1). Such items may still be blocklisted, but must stay in the client.
+func TestCleanupQueueKeepsPartlyImportedDownloadsInClient(t *testing.T) {
+	arr := &fakeQueueArr{}
+	s, now := graceTestService(t, arr)
+	arr.set(queueProblem(1, "PART", "One or more episodes expected in this release were not imported or missing from the release"))
+
+	if err := s.CleanupQueue(t.Context(), "arr"); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(queueCleanupGrace)
+	if err := s.CleanupQueue(t.Context(), "arr"); err != nil {
+		t.Fatal(err)
+	}
+
+	if arr.removed() != 1 {
+		t.Fatalf("bulk removals = %d, want 1", arr.removed())
+	}
+	if got := arr.fromClient[0]; got != "false" {
+		t.Fatalf("removeFromClient = %q, want \"false\" for a partly imported download", got)
+	}
+}
+
+func TestCleanupQueueStillRemovesUnimportedDownloadsFromClient(t *testing.T) {
+	arr := &fakeQueueArr{}
+	s, now := graceTestService(t, arr)
+	arr.set(importProblem(1, "NONE"))
+
+	if err := s.CleanupQueue(t.Context(), "arr"); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(queueCleanupGrace)
+	if err := s.CleanupQueue(t.Context(), "arr"); err != nil {
+		t.Fatal(err)
+	}
+
+	if arr.removed() != 1 || arr.fromClient[0] != "true" {
+		t.Fatalf("removals = %d, removeFromClient = %v; want one removal from the client", arr.removed(), arr.fromClient)
 	}
 }
