@@ -771,12 +771,15 @@ func (tb *Torbox) updateTorrentWithClient(client *request.Client, t *types.Torre
 		return nil, err
 	}
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, customerror.TorrentNotFoundError
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
 	}
 	data := res.Data
 	if data == nil {
-		return nil, fmt.Errorf("error getting torrent")
+		return nil, customerror.TorrentNotFoundError
 	}
 	name := data.Name
 
@@ -857,7 +860,9 @@ func (tb *Torbox) CheckStatus(torrent *types.Torrent) (*types.Torrent, error) {
 			}
 			return torrent, nil
 		default:
-			return torrent, torboxTorrentError(data)
+			// Keep the fork's detailed state/reason, and mark it terminal so the
+			// manager knows the provider failed the torrent (upstream c3fa307).
+			return torrent, fmt.Errorf("%w: %w", torboxTorrentError(data), customerror.TorrentFailedError)
 		}
 	}
 }

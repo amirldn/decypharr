@@ -302,6 +302,13 @@ func (m *Manager) processQueuedTorrent(entry *storage.Entry) {
 
 	dbT, err := client.CheckStatus(debridTorrent)
 	if err != nil {
+		if !customerror.IsTerminalTorrentError(err) && !errors.Is(err, customerror.TorrentNotFoundError) {
+			// The check failed, not the torrent (429, dropped connection...).
+			// The next tick polls it again (upstream c3fa307).
+			m.logger.Warn().Err(err).Str("name", entry.Name).Str("infohash", entry.InfoHash).
+				Msg("Status check failed, retrying on next tick")
+			return
+		}
 		if dbT != nil {
 			applyDebridTorrentToEntry(entry, dbT)
 		}
@@ -315,6 +322,12 @@ func (m *Manager) processQueuedTorrent(entry *storage.Entry) {
 		log.Msg("Error checking status")
 		entry.MarkAsError(err)
 		_ = m.queue.Update(entry)
+		// Remove the provider copy only on the provider's own verdict (failed,
+		// not cached, blocked). KGBos dropped this delete because a 429 used to
+		// reach it; the transient check above now returns before that.
+		if customerror.IsTerminalTorrentError(err) && dbT != nil && dbT.Id != "" {
+			go func(id string) { _ = client.DeleteTorrent(id) }(dbT.Id)
+		}
 		return
 	}
 
@@ -548,6 +561,15 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			m.hearsay.RecordAdd(decision, false)
 		}
 		if err != nil && torrent != nil && torrent.Id != "" {
+			if !customerror.IsTerminalTorrentError(err) {
+				// The provider accepted the torrent, so it stays there. The
+				// queue finds its real state on the next tick.
+				_logger.Warn().Err(err).Str("id", torrent.Id).Msg("Status check failed after submit, keeping torrent")
+				m.hearsay.DiscardAdd(decision)
+				torrent.Debrid = db.Config().Name
+				torrent.Status = debridTypes.TorrentStatusDownloading
+				return torrent, nil
+			}
 			// Delete the torrent if it was not downloaded
 			go func(id string) {
 				_ = db.DeleteTorrent(id)

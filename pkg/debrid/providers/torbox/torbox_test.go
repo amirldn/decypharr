@@ -2,6 +2,7 @@ package torbox
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/debrid/account"
@@ -352,6 +354,29 @@ func TestCheckStatusPreservesTorboxFailureContext(t *testing.T) {
 	}
 	if torrent == nil || torrent.InfoHash != "AABBCC" {
 		t.Fatalf("CheckStatus() torrent = %#v, want returned provider hash", torrent)
+	}
+	// The manager deletes the provider copy only for a terminal verdict (c3fa307).
+	if !customerror.IsTerminalTorrentError(err) {
+		t.Errorf("CheckStatus() error = %q, want a terminal torrent error", err)
+	}
+}
+
+func TestCheckStatusTreatsMissingTorrentAsNotFoundNotTerminal(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprint(w, `{"success":false,"data":null}`)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := testTorbox(server.URL).CheckStatus(&debridTypes.Torrent{Id: "404"})
+	if !errors.Is(err, customerror.TorrentNotFoundError) {
+		t.Fatalf("CheckStatus() error = %v, want TorrentNotFoundError", err)
+	}
+	if customerror.IsTerminalTorrentError(err) {
+		t.Fatalf("CheckStatus() error = %v is terminal; a missing torrent has no copy to delete", err)
 	}
 }
 
