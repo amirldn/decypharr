@@ -1,5 +1,8 @@
 # KGBos changes on upstream v2.6
 
+> Rebased onto upstream v2.7.2 on 2026-11-14. Where upstream later shipped the same fix, its code replaced
+> the KGBos/fork version; see [v2.7.2-rebase.md](v2.7.2-rebase.md).
+
 ## Sources
 
 - Upstream v2.6: `3a0e0e23de153c70b2d441e14a7828b29f6e8391`.

@@ -6,22 +6,28 @@
 > Saltbox host with **TorBox only**, an **rclone** mount (`vfs_cache_mode full`) and Plex. `main` is what that
 > host runs. Everything below this box is upstream's README.
 >
-> **Base:** upstream **v2.6** (`3a0e0e2`).
+> **Base:** upstream **v2.7.2** (`d6f8df0`). Rebased from v2.6 on 2026-11-14; where upstream had since
+> shipped the same fix, upstream's code replaced ours and our tests were kept. Details:
+> [`docs/operations/v2.7.2-rebase.md`](docs/operations/v2.7.2-rebase.md).
 >
-> **What this fork adds on top of v2.6:**
+> **What this fork adds on top of upstream:**
 >
 > 1. **KGBos TorBox reliability changes** (integrated from [KGBos/decypharr](https://github.com/KGBos/decypharr)
 >    `71ece25`; details in [`docs/operations/kgbos-v26-integration.md`](docs/operations/kgbos-v26-integration.md)):
 >    - TorBox backpressure, with cooldown state that survives restarts
 >    - a shared `/requestdl` budget with **priority lanes** (playback before probe and background)
->    - resolved-CDN-link caching, cached-only preflight and negative caching
+>    - lazy, budgeted CDN-link resolution and caching, cached-only preflight and negative caching
 >    - submission mediation and wider retryable-error handling
 >    - slow-stream detection with CDN link swapping
 >    - capped cache-warm concurrency, so season packs don't trip TorBox 429s
 > 2. **Local fixes:**
 >    - a VFS directory refresh between symlink retries
->    - category-less qBittorrent login (the Arr's URL as username, its API key as password)
->    - refetching links on HTTP 400 (already upstreamed via KGBos)
+>    - downloads reported complete before the pre-cache warm, which now runs in the background; qBittorrent
+>      add requests give up after 30s with a retryable 504
+>    - queue cleanup waits 15 minutes before blocklisting import problems, and keeps partly imported
+>      downloads in the client
+>    - entries added in the last 30 minutes are kept when TorBox's list lags behind
+>    - diagnostic logging for WebDAV 404s and torrent refreshes
 > 3. **Edge cache, a persistent head/tail store** (`pkg/edgecache`, PR #2). It keeps the first 16 MB and last
 >    4 MB of every media file on local disk, so player and transcoder start-up reads never wait on a cold
 >    TorBox fetch, however long ago a title was last played.
@@ -37,15 +43,13 @@
 >      background lane the caller set explicitly.
 >
 > **Branches:**
-> - `main` / `feat/edge-cache`: the deployed build.
-> - `integrate/kgbos-v2.6`: v2.6 + KGBos + local fixes, without the edge cache.
-> - `archive/main-2026-10-11`: the previous `main` (pre-v2.6 custom build on upstream `main`). It also
->   carries two post-v2.6 **upstream** fixes, `66c2cb5` (Arr authentication and recovery submissions) and
->   `26f9f51` (Radarr manual-import payloads). They were left out on purpose: this build already has its own
->   category-less Arr login, and neither bug appeared in the deployed logs. They will come back with the next
->   upstream rebase.
+> - `main`: the deployed build.
+> - `rebase/v2.7.2`: this rebase onto upstream v2.7.2.
+> - `feat/async-warm-add-timeout`, `feat/edge-cache`, `integrate/kgbos-v2.6`: the previous v2.6-based build
+>   and its layers.
+> - `archive/main-2026-10-11`: the pre-v2.6 custom build on upstream `main`.
 >
-> **Building:** `docker build --build-arg VERSION=2.6-custom-edge-<sha> --build-arg CHANNEL=stable -t amirldn/decypharr:2.6-custom-edge-<sha> .`
+> **Building:** `docker build --build-arg VERSION=2.7.2-custom-<sha> --build-arg CHANNEL=stable -t amirldn/decypharr:2.7.2-custom-<sha> .`
 > Images are built and deployed locally. They are not published to a registry.
 
 ![ui](docs/src/assets/images/index.png)
