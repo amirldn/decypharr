@@ -22,6 +22,13 @@ import (
 )
 
 const (
+	// rcloneStopGrace is how long rclone gets to exit after SIGINT before it
+	// is killed.
+	rcloneStopGrace = 5 * time.Second
+	// stopMountTimeout bounds the unmount at shutdown, inside Docker's 10s
+	// stop timeout.
+	stopMountTimeout = 4 * time.Second
+
 	FSName     = "decypharr:"
 	ConfigName = "decypharr"
 )
@@ -33,6 +40,7 @@ type Manager struct {
 	logger        zerolog.Logger
 	ctx           context.Context
 	cancel        context.CancelFunc
+	exited        chan struct{} // closed once the rclone process has been reaped
 	serverReady   chan struct{}
 	serverStarted atomic.Bool
 	info          atomic.Pointer[MountInfo]
@@ -147,7 +155,15 @@ func (m *Manager) Start(ctx context.Context) error {
 			args = append(args, "--cache-dir", cfg.Rclone.CacheDir)
 		}
 	}
-	m.cmd = exec.CommandContext(ctx, "rclone", args...)
+	// The process is bound to the manager's own context, not the caller's.
+	// The caller's context is the application's signal context: binding to it
+	// killed rclone the moment SIGTERM arrived, before Stop could unmount, so
+	// the FUSE mount was left behind on every shutdown. Stop cancels m.ctx
+	// only after unmounting; cancellation then asks rclone to exit (SIGINT)
+	// and kills it if it is still running after rcloneStopGrace.
+	m.cmd = exec.CommandContext(m.ctx, "rclone", args...)
+	m.cmd.Cancel = func() error { return m.cmd.Process.Signal(os.Interrupt) }
+	m.cmd.WaitDelay = rcloneStopGrace
 
 	// Route rclone output through lumberjack for rotation
 	m.cmd.Stdout = rotatingLog
@@ -157,6 +173,24 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start rclone: %w", err)
 	}
 	m.serverStarted.Store(true)
+
+	// Reap the process in exactly one place; Stop waits on exited.
+	exited := make(chan struct{})
+	m.exited = exited
+	go func(cmd *exec.Cmd) {
+		defer close(exited)
+		err := cmd.Wait()
+		switch {
+		case err == nil:
+			m.logger.Info().Msg("Client RC server exited normally")
+		case errors.Is(err, context.Canceled):
+			m.logger.Info().Msg("Client RC server terminated: context canceled")
+		case WasHardTerminated(err): // SIGKILL on *nix; non-zero exit on Windows
+			m.logger.Info().Msg("Client RC server hard-terminated")
+		default:
+			m.logger.Warn().Err(err).Msg("Client RC server exited")
+		}
+	}(m.cmd)
 
 	// Wait for server to be ready in a goroutine
 	go func() {
@@ -182,66 +216,29 @@ func (m *Manager) Start(ctx context.Context) error {
 		} else {
 			m.logger.Info().Msgf("Successfully mounted rclone filesystem")
 		}
-
-		// Wait for command to finish and log output
-		err := m.cmd.Wait()
-		switch {
-		case err == nil:
-			m.logger.Info().Msg("Client RC server exited normally")
-
-		case errors.Is(err, context.Canceled):
-			m.logger.Info().Msg("Client RC server terminated: context canceled")
-
-		case WasHardTerminated(err): // SIGKILL on *nix; non-zero exit on Windows
-			m.logger.Info().Msg("Client RC server hard-terminated")
-
-		default:
-		}
 	}()
 	return nil
 }
 
-// Stop stops the rclone RC server and unmounts all mounts
+// Stop unmounts, then stops the rclone RC server.
+//
+// The order matters: the RC unmount needs rclone running, so unmount first
+// and only then cancel the process context.
 func (m *Manager) Stop() error {
 	if !m.serverStarted.Load() {
 		return nil
 	}
 
 	m.logger.Info().Msg("Stopping rclone RC server")
-	// Cancel context and stop process
+	m.stopMount()
 	m.cancel()
 
-	// Stopping mount
-	m.stopMount()
-
-	if m.cmd != nil && m.cmd.Process != nil {
-		// Try graceful shutdown first
-		if err := m.cmd.Process.Signal(os.Interrupt); err != nil {
-			if killErr := m.cmd.Process.Kill(); killErr != nil {
-				return killErr
-			}
-		}
-
-		// Wait for process to exit with timeout
-		done := make(chan error, 1)
-		go func() {
-			done <- m.cmd.Wait()
-		}()
-
-		<-time.After(2 * time.Second)
-		if err := m.cmd.Process.Kill(); err != nil {
-			// Check if the process already finished
-			if !strings.Contains(err.Error(), "process already finished") {
-				return err
-			}
-		}
-
-		// Still wait for the Wait() to complete to clean up the process
+	if m.exited != nil {
 		select {
-		case <-done:
+		case <-m.exited:
 			m.logger.Info().Msg("Client process cleanup completed")
-		case <-time.After(5 * time.Second):
-			m.logger.Error().Msg("Parse cleanup timeout")
+		case <-time.After(rcloneStopGrace + 5*time.Second):
+			m.logger.Error().Msg("Timed out waiting for the rclone process to exit")
 		}
 	}
 
@@ -288,7 +285,14 @@ func (m *Manager) stopMount() {
 
 	m.logger.Info().Msg("Unmounting via RC")
 
-	m.unmount(m.ctx)
+	// A fresh context: the force-unmount fallback runs umount/fusermount with
+	// it, and those cannot start under a cancelled one.
+	ctx, cancel := context.WithTimeout(context.Background(), stopMountTimeout)
+	defer cancel()
+	if err := m.unmount(ctx); err != nil {
+		m.logger.Error().Err(err).Msg("Unmount failed; the mount may be left behind")
+		return
+	}
 	m.logger.Info().Msgf("Successfully unmounted %s", m.getMountInfo().LocalPath)
 }
 

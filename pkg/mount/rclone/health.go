@@ -17,7 +17,7 @@ func (m *Manager) RecoverMount(ctx context.Context) error {
 	m.logger.Warn().Msg("Attempting to recover mount")
 
 	// First try to unmount cleanly
-	m.unmount(ctx)
+	_ = m.unmount(ctx)
 
 	// Wait a moment
 	time.Sleep(1 * time.Second)

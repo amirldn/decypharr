@@ -191,26 +191,29 @@ func (m *Manager) performMount(ctx context.Context) error {
 }
 
 // unmount is the internal unmount function
-func (m *Manager) unmount(ctx context.Context) {
+// unmount removes the mount: through RC, falling back to umount/fusermount.
+// It returns an error only when every method failed.
+func (m *Manager) unmount(ctx context.Context) error {
 	mountInfo := m.getMountInfo()
 
 	if mountInfo == nil || !mountInfo.Mounted {
 		m.logger.Info().Msg("Mount not found or already unmounted")
-		return
+		return nil
 	}
 
 	m.logger.Info().Msg("Unmounting")
 
 	// Try RC unmount first
 
-	err := m.client.Unmount(context.Background(), mountInfo.LocalPath)
+	err := m.client.Unmount(ctx, mountInfo.LocalPath)
 
 	// If RC unmount fails or server is not ready, try force unmount
+	var forceErr error
 	if err != nil {
 		m.logger.Warn().Err(err).Msg("RC unmount failed, trying force unmount")
-		if err := m.forceUnmount(ctx); err != nil {
-			m.logger.Error().Err(err).Msg("Force unmount failed")
-			// Don't return error here, update the state anyway
+		if forceErr = m.forceUnmount(ctx); forceErr != nil {
+			m.logger.Error().Err(forceErr).Msg("Force unmount failed")
+			// Don't return early, update the state anyway
 		}
 	}
 
@@ -221,6 +224,7 @@ func (m *Manager) unmount(ctx context.Context) {
 		mountInfo.Error = err.Error()
 	}
 	m.logger.Info().Msg("Unmount completed")
+	return forceErr
 }
 
 // createConfig creates an rclone config entry for the provider
